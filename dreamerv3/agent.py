@@ -21,23 +21,18 @@ concat = lambda xs, a: jax.tree.map(lambda *x: jnp.concatenate(x, a), *xs)
 isimage = lambda s: s.dtype == np.uint8 and len(s.shape) == 3
 
 
-class Agent(embodied.jax.Agent):
+class WorldModel(nj.Module):
+  """World model: encoder, dynamics (RSSM), decoder, reward, continuation."""
 
-  banner = [
-      r"---  ___                           __   ______ ---",
-      r"--- |   \ _ _ ___ __ _ _ __  ___ _ \ \ / /__ / ---",
-      r"--- | |) | '_/ -_) _` | '  \/ -_) '/\ V / |_ \ ---",
-      r"--- |___/|_| \___\__,_|_|_|_\___|_|  \_/ |___/ ---",
-  ]
-
-  def __init__(self, obs_space, act_space, config):
+  def __init__(self, obs_space, act_space, config, name='wm'):
     self.obs_space = obs_space
     self.act_space = act_space
     self.config = config
-
+    
     exclude = ('is_first', 'is_last', 'is_terminal', 'reward')
     enc_space = {k: v for k, v in obs_space.items() if k not in exclude}
     dec_space = {k: v for k, v in obs_space.items() if k not in exclude}
+    
     self.enc = {
         'simple': rssm.Encoder,
     }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
@@ -57,11 +52,31 @@ class Agent(embodied.jax.Agent):
     self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew')
     self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con')
 
+    scales = config.loss_scales.copy()
+    rec = scales.pop('rec')
+    scales.update({k: rec for k in dec_space})
+    self.scales = scales
+
+  def initial(self, batch_size):
+    return (
+        self.enc.initial(batch_size),
+        self.dyn.initial(batch_size),
+        self.dec.initial(batch_size))
+
+
+class ActorCritic(nj.Module):
+  """Actor-Critic: policy and value function."""
+
+  def __init__(self, act_space, config, name='ac'):
+    self.act_space = act_space
+    self.config = config
+    
     d1, d2 = config.policy_dist_disc, config.policy_dist_cont
     outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
     self.pol = embodied.jax.MLPHead(
         act_space, outs, **config.policy, name='pol')
 
+    scalar = elements.Space(np.float32, ())
     self.val = embodied.jax.MLPHead(scalar, **config.value, name='val')
     self.slowval = embodied.jax.SlowModel(
         embodied.jax.MLPHead(scalar, **config.value, name='slowval'),
@@ -71,20 +86,53 @@ class Agent(embodied.jax.Agent):
     self.valnorm = embodied.jax.Normalize(**config.valnorm, name='valnorm')
     self.advnorm = embodied.jax.Normalize(**config.advnorm, name='advnorm')
 
+  def initial(self, batch_size):
+    return ()  # AC has no recurrent state
+
+
+class Agent(embodied.jax.Agent):
+
+  banner = [
+      r"---  ___                           __   ______ ---",
+      r"--- |   \ _ _ ___ __ _ _ __  ___ _ \ \ / /__ / ---",
+      r"--- | |) | '_/ -_) _` | '  \/ -_) '/\ V / |_ \ ---",
+      r"--- |___/|_| \___\__,_|_|_|_\___|_|  \_/ |___/ ---",
+  ]
+
+  def __init__(self, obs_space, act_space, config):
+    self.obs_space = obs_space
+    self.act_space = act_space
+    self.config = config
+
+    # Create modular components
+    self.wm = WorldModel(obs_space, act_space, config, name='wm')
+    self.ac = ActorCritic(act_space, config, name='ac')
+
+    # Expose components as Agent attributes for backward compatibility
+    self.enc = self.wm.enc
+    self.dyn = self.wm.dyn
+    self.dec = self.wm.dec
+    self.rew = self.wm.rew
+    self.con = self.wm.con
+    self.feat2tensor = self.wm.feat2tensor
+    self.scales = self.wm.scales
+
+    self.pol = self.ac.pol
+    self.val = self.ac.val
+    self.slowval = self.ac.slowval
+    self.retnorm = self.ac.retnorm
+    self.valnorm = self.ac.valnorm
+    self.advnorm = self.ac.advnorm
+
     self.modules = [
         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
 
-    scales = self.config.loss_scales.copy()
-    rec = scales.pop('rec')
-    scales.update({k: rec for k in dec_space})
-    self.scales = scales
-
   @property
   def policy_keys(self):
-    return '^(enc|dyn|dec|pol)/'
+    return '^(wm/enc|wm/dyn|wm/dec|ac/pol)/'
 
   @property
   def ext_space(self):

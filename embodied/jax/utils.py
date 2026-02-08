@@ -99,7 +99,7 @@ class SlowModel:
     self.model = model
     self.rate = rate
     self.every = every
-    name = self.model.path + '_count'
+    name = self.model.name + '_count'
     self.count = nj.Variable(jnp.zeros, (), i32, name=name)
 
   def __getattr__(self, name):
