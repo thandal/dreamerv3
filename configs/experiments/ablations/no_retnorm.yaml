@@ -1,0 +1,10 @@
+# Ablation: Disable Return Normalization
+# Tests the importance of percentile-based return normalization.
+#
+# DreamerV3 uses percentile normalization to stabilize learning across
+# different reward scales. This ablation removes that normalization.
+
+no_retnorm:
+  agent:
+    retnorm:
+      impl: none  # Disable return normalization (was 'perc')

@@ -9,6 +9,10 @@ import jax.numpy as jnp
 import ninjax as nj
 import numpy as np
 
+from . import latents as latents_module
+from . import encoders as encoders_module
+from . import decoders as decoders_module
+
 f32 = jnp.float32
 sg = jax.lax.stop_gradient
 
@@ -36,18 +40,22 @@ class RSSM(nj.Module):
     assert self.deter % self.blocks == 0
     self.act_space = act_space
     self.kw = kw
-    assert self.latent in ('onehot', 'twohot')
+
+    # Create latent representation
+    self.latent_impl = latents_module.create_latent(
+        self.latent, self.stoch, self.classes, unimix=self.unimix)
+    self.latent_shape = self.latent_impl.get_shape()
 
   @property
   def entry_space(self):
     return dict(
         deter=elements.Space(np.float32, self.deter),
-        stoch=elements.Space(np.float32, (self.stoch, self.classes)))
+        stoch=elements.Space(np.float32, self.latent_shape))
 
   def initial(self, bsize):
     carry = nn.cast(dict(
         deter=jnp.zeros([bsize, self.deter], f32),
-        stoch=jnp.zeros([bsize, self.stoch, self.classes], f32)))
+        stoch=jnp.zeros([bsize] + list(self.latent_shape), f32)))
     return carry
 
   def truncate(self, entries, carry=None):
@@ -120,30 +128,7 @@ class RSSM(nj.Module):
       return carry, feat, action
 
   def _sample(self, logit):
-    if self.latent == 'onehot':
-      return nn.cast(self._dist(logit).sample(seed=nj.seed()))
-    elif self.latent == 'twohot':
-      probs = jax.nn.softmax(logit, -1)
-      bins = jnp.arange(self.classes, dtype=f32)
-      # Weighted average position
-      pos = (probs * bins).sum(-1)
-      # Convert to two-hot with straight-through
-      stoch = self._twohot(pos)
-      # Straight-through to logits via probs
-      return nn.cast(stoch + (probs - sg(probs)))
-    else:
-      raise NotImplementedError(self.latent)
-
-  def _twohot(self, pos):
-    below = jnp.floor(pos).astype(jnp.int32)
-    above = below + 1
-    below = jnp.clip(below, 0, self.classes - 1)
-    above = jnp.clip(above, 0, self.classes - 1)
-    weight_above = pos - below
-    weight_below = 1.0 - weight_above
-    return (
-        jax.nn.one_hot(below, self.classes) * weight_below[..., None] +
-        jax.nn.one_hot(above, self.classes) * weight_above[..., None])
+    return nn.cast(self._dist(logit).sample(seed=nj.seed()))
 
   def loss(self, carry, tokens, acts, reset, training):
     metrics = {}
@@ -195,193 +180,25 @@ class RSSM(nj.Module):
 
   def _logit(self, name, x):
     kw = dict(**self.kw, outscale=self.outscale)
-    x = self.sub(name, nn.Linear, self.stoch * self.classes, **kw)(x)
-    return x.reshape(x.shape[:-1] + (self.stoch, self.classes))
+    # For Gaussian, we need stoch * 2 (mean + log_stddev)
+    # For categorical, we need stoch * classes
+    if self.latent == 'gaussian':
+      output_size = self.stoch * 2
+    else:
+      output_size = self.stoch * self.classes
+    x = self.sub(name, nn.Linear, output_size, **kw)(x)
+
+    # Reshape based on latent type
+    if self.latent == 'gaussian':
+      return x.reshape(x.shape[:-1] + (self.stoch, 2))
+    else:
+      return x.reshape(x.shape[:-1] + (self.stoch, self.classes))
 
   def _dist(self, logits):
-    out = embodied.jax.outs.OneHot(logits, self.unimix)
-    out = embodied.jax.outs.Agg(out, 1, jnp.sum)
-    return out
+    return self.latent_impl.create_dist(logits)
 
 
-class Encoder(nj.Module):
-
-  units: int = 1024
-  norm: str = 'rms'
-  act: str = 'gelu'
-  depth: int = 64
-  mults: tuple = (2, 3, 4, 4)
-  layers: int = 3
-  kernel: int = 5
-  symlog: bool = True
-  outer: bool = False
-  strided: bool = False
-
-  def __init__(self, obs_space, **kw):
-    assert all(len(s.shape) <= 3 for s in obs_space.values()), obs_space
-    self.obs_space = obs_space
-    self.veckeys = [k for k, s in obs_space.items() if len(s.shape) <= 2]
-    self.imgkeys = [k for k, s in obs_space.items() if len(s.shape) == 3]
-    self.depths = tuple(self.depth * mult for mult in self.mults)
-    self.kw = kw
-
-  @property
-  def entry_space(self):
-    return {}
-
-  def initial(self, batch_size):
-    return {}
-
-  def truncate(self, entries, carry=None):
-    return {}
-
-  def __call__(self, carry, obs, reset, training, single=False):
-    bdims = 1 if single else 2
-    outs = []
-    bshape = reset.shape
-
-    if self.veckeys:
-      vspace = {k: self.obs_space[k] for k in self.veckeys}
-      vecs = {k: obs[k] for k in self.veckeys}
-      squish = nn.symlog if self.symlog else lambda x: x
-      x = nn.DictConcat(vspace, 1, squish=squish)(vecs)
-      x = x.reshape((-1, *x.shape[bdims:]))
-      for i in range(self.layers):
-        x = self.sub(f'mlp{i}', nn.Linear, self.units, **self.kw)(x)
-        x = nn.act(self.act)(self.sub(f'mlp{i}norm', nn.Norm, self.norm)(x))
-      outs.append(x)
-
-    if self.imgkeys:
-      K = self.kernel
-      imgs = [obs[k] for k in sorted(self.imgkeys)]
-      assert all(x.dtype == jnp.uint8 for x in imgs)
-      x = nn.cast(jnp.concatenate(imgs, -1), force=True) / 255 - 0.5
-      x = x.reshape((-1, *x.shape[bdims:]))
-      for i, depth in enumerate(self.depths):
-        if self.outer and i == 0:
-          x = self.sub(f'cnn{i}', nn.Conv2D, depth, K, **self.kw)(x)
-        elif self.strided:
-          x = self.sub(f'cnn{i}', nn.Conv2D, depth, K, 2, **self.kw)(x)
-        else:
-          x = self.sub(f'cnn{i}', nn.Conv2D, depth, K, **self.kw)(x)
-          B, H, W, C = x.shape
-          x = x.reshape((B, H // 2, 2, W // 2, 2, C)).max((2, 4))
-        x = nn.act(self.act)(self.sub(f'cnn{i}norm', nn.Norm, self.norm)(x))
-      assert 3 <= x.shape[-3] <= 16, x.shape
-      assert 3 <= x.shape[-2] <= 16, x.shape
-      x = x.reshape((x.shape[0], -1))
-      outs.append(x)
-
-    x = jnp.concatenate(outs, -1)
-    tokens = x.reshape((*bshape, *x.shape[1:]))
-    entries = {}
-    return carry, entries, tokens
-
-
-class Decoder(nj.Module):
-
-  units: int = 1024
-  norm: str = 'rms'
-  act: str = 'gelu'
-  outscale: float = 1.0
-  depth: int = 64
-  mults: tuple = (2, 3, 4, 4)
-  layers: int = 3
-  kernel: int = 5
-  symlog: bool = True
-  bspace: int = 8
-  outer: bool = False
-  strided: bool = False
-
-  def __init__(self, obs_space, **kw):
-    assert all(len(s.shape) <= 3 for s in obs_space.values()), obs_space
-    self.obs_space = obs_space
-    self.veckeys = [k for k, s in obs_space.items() if len(s.shape) <= 2]
-    self.imgkeys = [k for k, s in obs_space.items() if len(s.shape) == 3]
-    self.depths = tuple(self.depth * mult for mult in self.mults)
-    self.imgdep = sum(obs_space[k].shape[-1] for k in self.imgkeys)
-    self.imgres = self.imgkeys and obs_space[self.imgkeys[0]].shape[:-1]
-    self.kw = kw
-
-  @property
-  def entry_space(self):
-    return {}
-
-  def initial(self, batch_size):
-    return {}
-
-  def truncate(self, entries, carry=None):
-    return {}
-
-  def __call__(self, carry, feat, reset, training, single=False):
-    assert feat['deter'].shape[-1] % self.bspace == 0
-    K = self.kernel
-    recons = {}
-    bshape = reset.shape
-    inp = [nn.cast(feat[k]) for k in ('stoch', 'deter')]
-    inp = [x.reshape((math.prod(bshape), -1)) for x in inp]
-    inp = jnp.concatenate(inp, -1)
-
-    if self.veckeys:
-      spaces = {k: self.obs_space[k] for k in self.veckeys}
-      o1, o2 = 'categorical', ('symlog_mse' if self.symlog else 'mse')
-      outputs = {k: o1 if v.discrete else o2 for k, v in spaces.items()}
-      kw = dict(**self.kw, act=self.act, norm=self.norm)
-      x = self.sub('mlp', nn.MLP, self.layers, self.units, **kw)(inp)
-      x = x.reshape((*bshape, *x.shape[1:]))
-      kw = dict(**self.kw, outscale=self.outscale)
-      outs = self.sub('vec', embodied.jax.DictHead, spaces, outputs, **kw)(x)
-      recons.update(outs)
-
-    if self.imgkeys:
-      factor = 2 ** (len(self.depths) - int(bool(self.outer)))
-      minres = [int(x // factor) for x in self.imgres]
-      assert 3 <= minres[0] <= 16, minres
-      assert 3 <= minres[1] <= 16, minres
-      shape = (*minres, self.depths[-1])
-      if self.bspace:
-        u, g = math.prod(shape), self.bspace
-        x0, x1 = nn.cast((feat['deter'], feat['stoch']))
-        x1 = x1.reshape((*x1.shape[:-2], -1))
-        x0 = x0.reshape((-1, x0.shape[-1]))
-        x1 = x1.reshape((-1, x1.shape[-1]))
-        x0 = self.sub('sp0', nn.BlockLinear, u, g, **self.kw)(x0)
-        x0 = einops.rearrange(
-            x0, '... (g h w c) -> ... h w (g c)',
-            h=minres[0], w=minres[1], g=g)
-        x1 = self.sub('sp1', nn.Linear, 2 * self.units, **self.kw)(x1)
-        x1 = nn.act(self.act)(self.sub('sp1norm', nn.Norm, self.norm)(x1))
-        x1 = self.sub('sp2', nn.Linear, shape, **self.kw)(x1)
-        x = nn.act(self.act)(self.sub('spnorm', nn.Norm, self.norm)(x0 + x1))
-      else:
-        x = self.sub('space', nn.Linear, shape, **kw)(inp)
-        x = nn.act(self.act)(self.sub('spacenorm', nn.Norm, self.norm)(x))
-      for i, depth in reversed(list(enumerate(self.depths[:-1]))):
-        if self.strided:
-          kw = dict(**self.kw, transp=True)
-          x = self.sub(f'conv{i}', nn.Conv2D, depth, K, 2, **kw)(x)
-        else:
-          x = x.repeat(2, -2).repeat(2, -3)
-          x = self.sub(f'conv{i}', nn.Conv2D, depth, K, **self.kw)(x)
-        x = nn.act(self.act)(self.sub(f'conv{i}norm', nn.Norm, self.norm)(x))
-      if self.outer:
-        kw = dict(**self.kw, outscale=self.outscale)
-        x = self.sub('imgout', nn.Conv2D, self.imgdep, K, **kw)(x)
-      elif self.strided:
-        kw = dict(**self.kw, outscale=self.outscale, transp=True)
-        x = self.sub('imgout', nn.Conv2D, self.imgdep, K, 2, **kw)(x)
-      else:
-        x = x.repeat(2, -2).repeat(2, -3)
-        kw = dict(**self.kw, outscale=self.outscale)
-        x = self.sub('imgout', nn.Conv2D, self.imgdep, K, **kw)(x)
-      x = jax.nn.sigmoid(x)
-      x = x.reshape((*bshape, *x.shape[1:]))
-      split = np.cumsum(
-          [self.obs_space[k].shape[-1] for k in self.imgkeys][:-1])
-      for k, out in zip(self.imgkeys, jnp.split(x, split, -1)):
-        out = embodied.jax.outs.MSE(out)
-        out = embodied.jax.outs.Agg(out, 3, jnp.sum)
-        recons[k] = out
-
-    entries = {}
-    return carry, entries, recons
+# Backward compatibility: Keep Encoder and Decoder classes in rssm module
+# These are now defined in separate files but imported here for compatibility
+Encoder = encoders_module.SimpleEncoder
+Decoder = decoders_module.SimpleDecoder

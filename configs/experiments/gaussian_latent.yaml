@@ -1,0 +1,19 @@
+# Gaussian Latent Representation Experiment
+# Replace categorical (one-hot) latent variables with Gaussian latents.
+# This tests whether continuous latent representations work better than discrete.
+#
+# Reference: Original RSSM (Hafner et al., 2019) used Gaussian latents
+#
+# Technical notes:
+# - Gaussian latents use shape (stoch,) instead of (stoch, classes)
+# - Network outputs stoch * 2 parameters: mean and log_stddev
+# - Standard deviation is clipped to [0.1, 1.0] by default
+# - KL divergence is computed analytically for Gaussians
+
+gaussian_latent:
+  agent:
+    dyn:
+      rssm:
+        latent: gaussian  # Change from onehot to gaussian
+        # Note: When using gaussian, 'classes' parameter is ignored
+        # and 'stoch' determines the dimensionality of the Gaussian

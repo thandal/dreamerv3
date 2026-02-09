@@ -1,0 +1,8 @@
+# Ablation: Layer Normalization
+# Replace RMS normalization with standard Layer Normalization.
+#
+# DreamerV3 uses RMS norm. This tests whether LayerNorm works similarly.
+
+layer_norm:
+  agent:
+    .*\.norm: layer  # Replace all normalizations with layer (was rms)

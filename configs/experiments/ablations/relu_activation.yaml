@@ -1,0 +1,8 @@
+# Ablation: ReLU Activation
+# Replace SiLU (Swish) activations with standard ReLU.
+#
+# DreamerV3 uses SiLU throughout. This tests whether simpler ReLU works.
+
+relu_activation:
+  agent:
+    .*\.act: relu  # Replace all activations with relu (was silu)

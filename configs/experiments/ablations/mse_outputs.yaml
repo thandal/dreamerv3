@@ -1,0 +1,13 @@
+# Ablation: MSE Output Distributions
+# Replace symexp_twohot with simple MSE regression for reward and value.
+#
+# DreamerV3 uses symlog + two-hot encoding for reward/value predictions.
+# This tests whether simple MSE regression works as well.
+
+mse_outputs:
+  agent:
+    rewhead:
+      output: symlog_mse  # Change from symexp_twohot to symlog_mse
+
+    value:
+      output: symlog_mse  # Change from symexp_twohot to symlog_mse

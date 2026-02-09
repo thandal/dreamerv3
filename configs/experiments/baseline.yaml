@@ -1,0 +1,16 @@
+# Baseline DreamerV3 Configuration
+# This is the standard DreamerV3 setup with all default parameters.
+# Use this as a reference for ablation studies.
+
+# No changes needed - all defaults from configs.yaml are used
+# This file serves as documentation that this is the baseline configuration
+
+baseline:
+  # Standard DreamerV3 with:
+  # - One-hot categorical latent representation
+  # - Block-diagonal GRU sequence model
+  # - SiLU activations
+  # - RMS normalization
+  # - Symexp-TwoHot output distributions
+  # - Percentile return normalization
+  # - TD(λ) with λ=0.95

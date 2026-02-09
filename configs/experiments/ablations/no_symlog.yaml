@@ -1,0 +1,12 @@
+# Ablation: Remove Symlog Transformation
+# Tests the importance of symlog (symmetric logarithm) transformation
+# applied to observations before encoding.
+#
+# Symlog helps with unbounded observations by compressing large values
+# while preserving small values and sign information.
+
+no_symlog:
+  agent:
+    enc:
+      simple:
+        symlog: False  # Disable symlog transformation

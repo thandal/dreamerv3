@@ -11,6 +11,8 @@ import numpy as np
 import optax
 
 from . import rssm
+from . import encoders as encoders_module
+from . import decoders as decoders_module
 
 f32 = jnp.float32
 i32 = jnp.int32
@@ -32,16 +34,19 @@ class WorldModel(nj.Module):
     exclude = ('is_first', 'is_last', 'is_terminal', 'reward')
     enc_space = {k: v for k, v in obs_space.items() if k not in exclude}
     dec_space = {k: v for k, v in obs_space.items() if k not in exclude}
-    
-    self.enc = {
-        'simple': rssm.Encoder,
-    }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
+
+    # Use encoder registry
+    self.enc = encoders_module.create_encoder(
+        config.enc.typ, enc_space, **config.enc[config.enc.typ], name='enc')
+
+    # Use dynamics (RSSM) factory
     self.dyn = {
         'rssm': rssm.RSSM,
     }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn')
-    self.dec = {
-        'simple': rssm.Decoder,
-    }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
+
+    # Use decoder registry
+    self.dec = decoders_module.create_decoder(
+        config.dec.typ, dec_space, **config.dec[config.dec.typ], name='dec')
 
     self.feat2tensor = lambda x: jnp.concatenate([
         nn.cast(x['deter']),
