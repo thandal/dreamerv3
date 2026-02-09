@@ -48,9 +48,21 @@ class WorldModel(nj.Module):
     self.dec = decoders_module.create_decoder(
         config.dec.typ, dec_space, **config.dec[config.dec.typ], name='dec')
 
-    self.feat2tensor = lambda x: jnp.concatenate([
-        nn.cast(x['deter']),
-        nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
+    # feat2tensor needs to handle both categorical (stoch, classes) and
+    # continuous (stoch,) latent shapes
+    def feat2tensor(x):
+      deter = nn.cast(x['deter'])
+      stoch = nn.cast(x['stoch'])
+      # Flatten stoch: handles both (B, T, stoch, classes) and (B, T, stoch)
+      if stoch.ndim == deter.ndim:
+        # Gaussian: (B, T, stoch) - already flat
+        stoch_flat = stoch
+      else:
+        # Categorical: (B, T, stoch, classes) -> (B, T, stoch*classes)
+        stoch_flat = stoch.reshape((*stoch.shape[:-2], -1))
+      return jnp.concatenate([deter, stoch_flat], -1)
+
+    self.feat2tensor = feat2tensor
 
     scalar = elements.Space(np.float32, ())
     binary = elements.Space(bool, (), 0, 2)

@@ -352,3 +352,8 @@ twohot_latent:
   agent:
     dyn:
       rssm: {latent: twohot}
+
+gaussian_latent:
+  agent:
+    dyn:
+      rssm: {latent: gaussian}
