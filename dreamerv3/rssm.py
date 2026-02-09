@@ -30,11 +30,13 @@ class RSSM(nj.Module):
   absolute: bool = False
   blocks: int = 8
   free_nats: float = 1.0
+  latent: str = 'onehot'
 
   def __init__(self, act_space, **kw):
     assert self.deter % self.blocks == 0
     self.act_space = act_space
     self.kw = kw
+    assert self.latent in ('onehot', 'twohot')
 
   @property
   def entry_space(self):
@@ -84,7 +86,7 @@ class RSSM(nj.Module):
       x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
     logit = self._logit('obslogit', x)
-    stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
+    stoch = self._sample(logit)
     carry = dict(deter=deter, stoch=stoch)
     feat = dict(deter=deter, stoch=stoch, logit=logit)
     entry = dict(deter=deter, stoch=stoch)
@@ -97,7 +99,7 @@ class RSSM(nj.Module):
       actemb = nn.DictConcat(self.act_space, 1)(action)
       deter = self._core(carry['deter'], carry['stoch'], actemb)
       logit = self._prior(deter)
-      stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
+      stoch = self._sample(logit)
       carry = nn.cast(dict(deter=deter, stoch=stoch))
       feat = nn.cast(dict(deter=deter, stoch=stoch, logit=logit))
       assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
@@ -116,6 +118,32 @@ class RSSM(nj.Module):
       # entries = dict(deter=feat['deter'], stoch=feat['stoch'])
       # return carry, entries, feat, action
       return carry, feat, action
+
+  def _sample(self, logit):
+    if self.latent == 'onehot':
+      return nn.cast(self._dist(logit).sample(seed=nj.seed()))
+    elif self.latent == 'twohot':
+      probs = jax.nn.softmax(logit, -1)
+      bins = jnp.arange(self.classes, dtype=f32)
+      # Weighted average position
+      pos = (probs * bins).sum(-1)
+      # Convert to two-hot with straight-through
+      stoch = self._twohot(pos)
+      # Straight-through to logits via probs
+      return nn.cast(stoch + (probs - sg(probs)))
+    else:
+      raise NotImplementedError(self.latent)
+
+  def _twohot(self, pos):
+    below = jnp.floor(pos).astype(jnp.int32)
+    above = below + 1
+    below = jnp.clip(below, 0, self.classes - 1)
+    above = jnp.clip(above, 0, self.classes - 1)
+    weight_above = pos - below
+    weight_below = 1.0 - weight_above
+    return (
+        jax.nn.one_hot(below, self.classes) * weight_below[..., None] +
+        jax.nn.one_hot(above, self.classes) * weight_above[..., None])
 
   def loss(self, carry, tokens, acts, reset, training):
     metrics = {}
