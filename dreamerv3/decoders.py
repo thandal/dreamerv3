@@ -110,9 +110,15 @@ class SimpleDecoder(nj.Module):
             if self.bspace:
                 u, g = math.prod(shape), self.bspace
                 x0, x1 = nn.cast((feat['deter'], feat['stoch']))
-                x1 = x1.reshape((*x1.shape[:-2], -1))
+                # Handle both categorical (B, T, stoch, classes) and Gaussian (B, T, stoch)
+                if x1.ndim == x0.ndim:
+                    # Gaussian: already flat
+                    x1_flat = x1
+                else:
+                    # Categorical: flatten stoch and classes dimensions
+                    x1_flat = x1.reshape((*x1.shape[:-2], -1))
                 x0 = x0.reshape((-1, x0.shape[-1]))
-                x1 = x1.reshape((-1, x1.shape[-1]))
+                x1 = x1_flat.reshape((-1, x1_flat.shape[-1]))
                 x0 = self.sub('sp0', nn.BlockLinear, u, g, **self.kw)(x0)
                 x0 = einops.rearrange(
                     x0, '... (g h w c) -> ... h w (g c)',
