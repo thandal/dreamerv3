@@ -8,7 +8,7 @@ elements>=3.19.1
 google-resumable-media>=2.7.2
 granular>=0.20.3
 ipdb
-jax[cuda12]==0.4.33
+jax[cuda12]==0.5.3
 jaxtyping
 ninjax>=3.5.1
 numpy<2  # DMLab: <2, MineRLv1.0: <1.24
