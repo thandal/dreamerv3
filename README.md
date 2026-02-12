@@ -59,19 +59,20 @@ follow the manual instructions below.
 
 ## Manual
 
-Install [JAX][jax] and then the other dependencies:
+Set up python virtual environment and install dependencies:
 
 ```sh
+python -m venv python_env
+source python_env/bin/activate
+pip install jax[cuda]==0.5.0   # Seems like we need to install jax first, even though its also in requirements?!?
 pip install -U -r requirements.txt
+pip install crafter
 ```
 
 Training script:
 
 ```sh
-python dreamerv3/main.py \
-  --logdir ~/logdir/dreamer/{timestamp} \
-  --configs crafter \
-  --run.train_ratio 32
+python dreamerv3/main.py --logdir ~/logdir/dreamer/{timestamp} --configs crafter --run.train_ratio 32
 ```
 
 To reproduce results, train on the desired task using the corresponding config,
