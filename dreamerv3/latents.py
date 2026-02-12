@@ -8,6 +8,7 @@ Available latent types:
 - OneHotLatent: Categorical distribution with one-hot encoding (default)
 - TwoHotLatent: Weighted two-hot encoding for smoother representations
 - GaussianLatent: Continuous Gaussian distribution
+- VQVAELatent: Vector-quantized discrete codes via learned codebook
 """
 
 import jax
@@ -231,11 +232,120 @@ class GaussianLatent(LatentBase):
         return (self.stoch,)
 
 
+class VQVAELatent(LatentBase):
+    """VQ-VAE discrete latent representation.
+
+    Uses a learned codebook of embedding vectors. The RSSM produces logits
+    that are treated as continuous queries; the nearest codebook entry is
+    selected via argmin distance, with straight-through gradients.
+
+    Shape: (stoch, classes) - Same as one-hot (one-hot over codebook indices)
+
+    The commitment loss (encoder encouraged to commit to codebook vectors)
+    is exposed through the distribution's kl() method so it integrates
+    naturally as the KL term in the RSSM loss.
+    """
+
+    def __init__(self, stoch: int, classes: int,
+                 commitment_cost: float = 0.25,
+                 temperature: float = 1.0, **kwargs):
+        """
+        Args:
+            stoch: Number of stochastic variables (each picks a codebook entry)
+            classes: Codebook size (number of embedding vectors)
+            commitment_cost: Weight for commitment loss (β in VQ-VAE paper)
+            temperature: Temperature for softmax over distances
+        """
+        super().__init__(stoch, classes, **kwargs)
+        self.commitment_cost = commitment_cost
+        self.temperature = temperature
+
+    def create_dist(self, logits):
+        """Create VQ-VAE distribution from logits.
+
+        Args:
+            logits: Shape (..., stoch, classes) — treated as continuous queries
+
+        Returns:
+            VQVAEDist distribution object
+        """
+        return VQVAEDist(
+            logits, self.stoch, self.classes,
+            self.commitment_cost, self.temperature)
+
+    def get_shape(self):
+        return (self.stoch, self.classes)
+
+
+class VQVAEDist:
+    """Distribution for VQ-VAE with straight-through gradients.
+
+    Treats input logits as continuous queries into a discrete codebook.
+    Each stoch variable independently selects the nearest codebook entry.
+    """
+
+    def __init__(self, logits, stoch, classes,
+                 commitment_cost=0.25, temperature=1.0):
+        self.logits = f32(logits)  # (..., stoch, classes)
+        self.stoch = stoch
+        self.classes = classes
+        self.commitment_cost = commitment_cost
+        self.temperature = temperature
+        # Compute soft probabilities from logits (used for entropy/logp)
+        self._probs = jax.nn.softmax(self.logits / self.temperature, -1)
+
+    def sample(self, seed):
+        """Sample by selecting the argmax codebook entry (one-hot).
+
+        Uses straight-through gradient: forward pass is hard one-hot,
+        backward pass uses soft probabilities.
+        """
+        # Hard selection: argmax over classes dimension
+        indices = jnp.argmax(self.logits, axis=-1)  # (..., stoch)
+        hard = jax.nn.one_hot(indices, self.classes)  # (..., stoch, classes)
+        # Straight-through: hard forward, soft backward
+        return f32(hard + (self._probs - sg(self._probs)))
+
+    def logp(self, event):
+        """Log probability (treat as categorical over codebook)."""
+        logprob = jax.nn.log_softmax(self.logits / self.temperature, -1)
+        return (logprob * event).sum(-1).sum(-1)  # Sum over classes and stoch
+
+    def entropy(self):
+        """Entropy of the categorical distribution over codebook entries."""
+        logprob = jax.nn.log_softmax(self.logits / self.temperature, -1)
+        entropy = -(self._probs * logprob).sum(-1)  # Per stoch variable
+        return entropy.sum(-1)  # Sum over stoch dimension
+
+    def kl(self, other):
+        """Commitment loss as KL surrogate.
+
+        For VQ-VAE, the "KL" between posterior and prior is replaced by
+        the commitment loss: β * ||z_e - sg(e)||² + ||sg(z_e) - e||²
+
+        When called as dist(sg(post)).kl(dist(prior)) [dynamics loss],
+        this measures how far the prior's logits are from the posterior's
+        selected codebook entries. When called as
+        dist(post).kl(dist(sg(prior))) [representation loss], it measures
+        how far the posterior's logits are from the prior's entries.
+
+        This maps naturally to the RSSM's dyn/rep loss structure.
+        """
+        assert isinstance(other, VQVAEDist), type(other)
+        # Codebook loss: pull codebook entries toward encoder outputs
+        codebook_loss = jnp.square(self.logits - sg(other.logits)).sum(-1)
+        # Commitment loss: pull encoder outputs toward codebook entries
+        commit_loss = jnp.square(sg(self.logits) - other.logits).sum(-1)
+        # Combined per-stoch loss, then sum over stoch
+        return (codebook_loss + self.commitment_cost * commit_loss).sum(-1)
+
+
 # Registry for latent types
 LATENT_TYPES = {
     'onehot': OneHotLatent,
     'twohot': TwoHotLatent,
     'gaussian': GaussianLatent,
+    'vqvae': VQVAELatent,
 }
 
 

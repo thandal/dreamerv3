@@ -124,8 +124,8 @@ defaults:
         blocks: 8            # Number of GRU blocks (block-diagonal structure)
         free_nats: 1.0       # Free nats for KL divergence
 
-        # Latent representation type - Already configurable (onehot, twohot)
-        # See 'twohot_latent' preset below for example
+        # Latent representation type - Already configurable (onehot, twohot, gaussian, vqvae)
+        # See 'twohot_latent', 'gaussian_latent', 'vqvae_latent' presets below
         latent: onehot
 
     # Encoder configuration
@@ -357,3 +357,8 @@ gaussian_latent:
   agent:
     dyn:
       rssm: {latent: gaussian}
+
+vqvae_latent:
+  agent:
+    dyn:
+      rssm: {latent: vqvae}
