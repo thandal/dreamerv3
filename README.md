@@ -64,8 +64,8 @@ Set up python virtual environment and install dependencies:
 ```sh
 python -m venv python_env
 source python_env/bin/activate
-pip install jax[cuda]==0.5.0   # Seems like we need to install jax first, even though its also in requirements?!?
 pip install -U -r requirements.txt
+pip install jax[cuda]==0.5.3   # Seems like we need to install the specific version of jax *last* (overwriting whatever was installed in the dependencies!)
 pip install crafter
 ```
 
