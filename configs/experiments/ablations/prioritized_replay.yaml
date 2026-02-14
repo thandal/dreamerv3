@@ -1,0 +1,14 @@
+# Ablation: Prioritized Experience Replay (Schaul et al., 2016)
+# Tests the impact of prioritized sampling using model loss as priority signal.
+#
+# DreamerV3 uses uniform replay by default. This ablation enables
+# prioritized sampling (50/50 mix with uniform) with IS weight correction.
+# Use fracs.priority to control prioritization strength.
+
+prioritized_replay:
+  replay:
+    fracs: {uniform: 0.5, priority: 0.5, recency: 0.0}
+    prio:
+      is_correction: True  # Enable IS weight correction (β annealing)
+      beta0: 0.4           # Initial β (annealed to 1.0)
+      beta_frames: 1e7     # Steps to anneal β to 1.0

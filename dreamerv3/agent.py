@@ -201,24 +201,44 @@ class Agent(embodied.jax.Agent):
 
   def train(self, carry, data):
     carry, obs, prevact, stepid = self._apply_replay_context(carry, data)
+    # Extract IS weights from data (added by prioritized replay buffer)
+    is_weights = data.get('is_weights', None)
     metrics, (carry, entries, outs, mets) = self.opt(
-        self.loss, carry, obs, prevact, training=True, has_aux=True)
+        self.loss, carry, obs, prevact, is_weights, training=True,
+        has_aux=True)
     metrics.update(mets)
     self.slowval.update()
-    outs = {}
+    # Extract priority signal from raw losses before overwriting outs
+    losses_raw = outs.get('losses', {})
+    replay_outs = {}
     if self.config.replay_context:
       updates = elements.tree.flatdict(dict(
           stepid=stepid, enc=entries[0], dyn=entries[1], dec=entries[2]))
       B, T = obs['is_first'].shape
       assert all(x.shape[:2] == (B, T) for x in updates.values()), (
           (B, T), {k: v.shape for k, v in updates.items()})
-      outs['replay'] = updates
-    # if self.config.replay.fracs.priority > 0:
-    #   outs['replay']['priority'] = losses['model']
+      replay_outs.update(updates)
+    else:
+      replay_outs['stepid'] = data['stepid']
+    # Emit priority signal for prioritized replay
+    if losses_raw:
+      # Compute per-sequence priority as mean loss over time
+      # Use total scaled model loss as priority (analogous to TD error)
+      model_keys = [k for k in losses_raw if k not in ('policy', 'value', 'repval')]
+      if model_keys:
+        prio = sum(
+            losses_raw[k].mean(-1) * self.scales[k]
+            for k in model_keys)
+        # Broadcast to (B, T) by repeating the per-sequence priority
+        B, T = next(iter(losses_raw.values())).shape
+        replay_outs['priority'] = jnp.broadcast_to(
+            prio[:, None], (B, T))
+    outs = {}
+    outs['replay'] = replay_outs
     carry = (*carry, {k: data[k][:, -1] for k in self.act_space})
     return carry, outs, metrics
 
-  def loss(self, carry, obs, prevact, training):
+  def loss(self, carry, obs, prevact, is_weights, training):
     enc_carry, dyn_carry, dec_carry = carry
     reset = obs['is_first']
     B, T = reset.shape
@@ -302,7 +322,15 @@ class Agent(embodied.jax.Agent):
     assert set(losses.keys()) == set(self.scales.keys()), (
         sorted(losses.keys()), sorted(self.scales.keys()))
     metrics.update({f'loss/{k}': v.mean() for k, v in losses.items()})
-    loss = sum([v.mean() * self.scales[k] for k, v in losses.items()])
+    # Compute per-element scaled loss
+    per_element_loss = sum(
+        [v.mean(-1) * self.scales[k] for k, v in losses.items()])
+    # Apply IS weights for prioritized replay (per-batch-element weighting)
+    if is_weights is not None:
+      is_weights_jnp = jnp.array(is_weights).reshape(per_element_loss.shape)
+      per_element_loss = per_element_loss * is_weights_jnp
+      metrics['is_weight_mean'] = is_weights_jnp.mean()
+    loss = per_element_loss.mean()
 
     carry = (enc_carry, dyn_carry, dec_carry)
     entries = (enc_entries, dyn_entries, dec_entries)
@@ -321,7 +349,7 @@ class Agent(embodied.jax.Agent):
 
     # Train metrics
     _, (new_carry, entries, outs, mets) = self.loss(
-        carry, obs, prevact, training=False)
+        carry, obs, prevact, None, training=False)
     mets.update(mets)
 
     # Grad norms
@@ -329,7 +357,7 @@ class Agent(embodied.jax.Agent):
       for key in self.scales:
         try:
           lossfn = lambda data, carry: self.loss(
-              carry, obs, prevact, training=False)[1][2]['losses'][key].mean()
+              carry, obs, prevact, None, training=False)[1][2]['losses'][key].mean()
           grad = nj.grad(lossfn, self.modules)(data, carry)[-1]
           metrics[f'gradnorm/{key}'] = optax.global_norm(grad)
         except KeyError:

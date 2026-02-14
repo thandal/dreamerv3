@@ -355,3 +355,135 @@ class TestReplay:
       [worker.join() for worker in workers]
 
     assert len(replay) == capacity
+
+  def test_prioritized_sampling(self):
+    """Test that Prioritized selector samples proportional to priority."""
+    from embodied.core import selectors
+    prio = selectors.Prioritized(exponent=1.0, initial=1.0, seed=42)
+    # Insert 10 items with step IDs
+    for i in range(10):
+      stepid = np.array([i], dtype=np.uint8).tobytes()
+      prio[i] = [stepid]
+    # Set high priority for item 0, low for rest
+    high_stepid = np.array([0], dtype=np.uint8).tobytes()
+    prio.prioritize([high_stepid], [100.0])
+    # Sample many times and check item 0 is sampled more often
+    counts = collections.defaultdict(int)
+    for _ in range(1000):
+      key = prio()
+      counts[key] += 1
+    # Item 0 should be sampled ~91% of the time (100 vs 9*1=9 total rest)
+    assert counts[0] > 700, f'High priority item only sampled {counts[0]}/1000'
+    assert counts[0] < 990, f'High priority item sampled too much {counts[0]}/1000'
+
+  def test_prioritized_is_weights(self):
+    """Test IS weight computation with β annealing."""
+    from embodied.core import selectors
+    prio = selectors.Prioritized(
+        exponent=1.0, initial=1.0, seed=42,
+        is_correction=True, beta0=1.0, beta_frames=1000)
+    # With beta=1.0 and uniform priorities, IS weights should be ~1.0
+    for i in range(10):
+      stepid = np.array([i], dtype=np.uint8).tobytes()
+      prio[i] = [stepid]
+    weights = []
+    for _ in range(100):
+      prio()
+      weights.append(prio.get_is_weight())
+    weights = np.array(weights)
+    # All weights should be close to 1.0 when priorities are uniform
+    assert np.allclose(weights, 1.0, atol=0.01), f'Weights not uniform: {weights.mean()}'
+
+  def test_prioritized_is_weights_nonuniform(self):
+    """Test IS weights compensate for non-uniform sampling."""
+    from embodied.core import selectors
+    prio = selectors.Prioritized(
+        exponent=1.0, initial=1.0, seed=42,
+        is_correction=True, beta0=1.0, beta_frames=1)
+    for i in range(10):
+      stepid = np.array([i], dtype=np.uint8).tobytes()
+      prio[i] = [stepid]
+    # Set item 0 to have 100x priority
+    high_stepid = np.array([0], dtype=np.uint8).tobytes()
+    prio.prioritize([high_stepid], [100.0])
+    # Sample item 0 — it should have LOW IS weight (downweight oversampled)
+    weights_high = []
+    weights_low = []
+    for _ in range(500):
+      key = prio()
+      w = prio.get_is_weight()
+      if key == 0:
+        weights_high.append(w)
+      else:
+        weights_low.append(w)
+    if weights_high and weights_low:
+      # High-priority items should have lower IS weight
+      assert np.mean(weights_high) < np.mean(weights_low), (
+          f'IS weight for high-prio ({np.mean(weights_high):.3f}) should be '
+          f'< low-prio ({np.mean(weights_low):.3f})')
+
+  def test_prioritized_no_is_correction(self):
+    """Test IS weights are 1.0 when is_correction is disabled."""
+    from embodied.core import selectors
+    prio = selectors.Prioritized(
+        exponent=1.0, initial=1.0, seed=42, is_correction=False)
+    for i in range(5):
+      stepid = np.array([i], dtype=np.uint8).tobytes()
+      prio[i] = [stepid]
+    for _ in range(20):
+      prio()
+      assert prio.get_is_weight() == 1.0
+
+  def test_prioritized_alpha_zero(self):
+    """Test that α=0 gives uniform sampling regardless of priorities."""
+    from embodied.core import selectors
+    prio = selectors.Prioritized(exponent=0.0, initial=1.0, seed=42)
+    for i in range(5):
+      stepid = np.array([i], dtype=np.uint8).tobytes()
+      prio[i] = [stepid]
+    # Set wildly different priorities
+    for i in range(5):
+      stepid = np.array([i], dtype=np.uint8).tobytes()
+      prio.prioritize([stepid], [10 ** i])
+    # With α=0, all items should be sampled roughly equally
+    counts = collections.defaultdict(int)
+    for _ in range(1000):
+      counts[prio()] += 1
+    for key, count in counts.items():
+      assert count > 100, f'Item {key} only sampled {count}/1000 (expected ~200)'
+
+  def test_replay_with_prioritized_selector(self):
+    """Test end-to-end replay buffer with Mixture + Prioritized selector."""
+    from embodied.core import selectors
+    selector = selectors.Mixture(dict(
+        uniform=selectors.Uniform(seed=0),
+        priority=selectors.Prioritized(
+            exponent=0.8, initial=1.0, seed=0,
+            is_correction=True, beta0=0.4, beta_frames=100),
+    ), dict(uniform=0.5, priority=0.5))
+    replay = embodied.replay.Replay(
+        length=3, capacity=20, selector=selector)
+    for step in range(10):
+      replay.add({'step': step})
+    batch = replay.sample(4)
+    assert 'is_weights' in batch
+    assert batch['is_weights'].shape == (4, 1)
+    assert (batch['is_weights'] > 0).all()
+
+  def test_beta_annealing(self):
+    """Test β anneals from β₀ to 1.0 over beta_frames."""
+    from embodied.core import selectors
+    prio = selectors.Prioritized(
+        exponent=1.0, initial=1.0, seed=42,
+        is_correction=True, beta0=0.4, beta_frames=100)
+    assert abs(prio.beta - 0.4) < 0.01
+    # Simulate sampling
+    for i in range(5):
+      stepid = np.array([i], dtype=np.uint8).tobytes()
+      prio[i] = [stepid]
+    for _ in range(50):
+      prio()
+    assert 0.6 < prio.beta < 0.8, f'Beta should be ~0.7, got {prio.beta}'
+    for _ in range(50):
+      prio()
+    assert abs(prio.beta - 1.0) < 0.01, f'Beta should be ~1.0, got {prio.beta}'

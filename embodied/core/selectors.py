@@ -126,12 +126,21 @@ class Recency:
 
 
 class Prioritized:
+  """Prioritized experience replay selector (Schaul et al., 2016).
+
+  Samples transitions proportional to their priority raised to exponent α.
+  When α=0, sampling is uniform. When α=1, fully prioritized.
+
+  Supports importance sampling (IS) weight correction with β annealing
+  to compensate for the non-uniform sampling distribution.
+  """
 
   def __init__(
       self, exponent=1.0, initial=1.0, zero_on_sample=False,
-      maxfrac=0.0, branching=16, seed=0):
+      maxfrac=0.0, branching=16, seed=0,
+      is_correction=False, beta0=0.4, beta_frames=1e7):
     assert 0 <= maxfrac <= 1, maxfrac
-    self.exponent = float(exponent)
+    self.exponent = float(exponent)  # α: prioritization strength (0=uniform)
     self.initial = float(initial)
     self.zero_on_sample = zero_on_sample
     self.maxfrac = maxfrac
@@ -139,6 +148,18 @@ class Prioritized:
     self.prios = collections.defaultdict(lambda: self.initial)
     self.stepitems = collections.defaultdict(list)
     self.items = {}
+    # Importance sampling weight correction
+    self.is_correction = is_correction
+    self.beta0 = float(beta0)
+    self.beta_frames = int(beta_frames)
+    self._sample_count = 0
+    self._last_sampled_key = None
+
+  @property
+  def beta(self):
+    """Current β value, annealed linearly from β₀ to 1.0."""
+    frac = min(1.0, self._sample_count / max(1, self.beta_frames))
+    return self.beta0 + frac * (1.0 - self.beta0)
 
   def prioritize(self, stepids, priorities):
     if not isinstance(stepids[0], bytes):
@@ -162,10 +183,42 @@ class Prioritized:
 
   def __call__(self):
     key = self.tree.sample()
+    self._last_sampled_key = key
+    self._sample_count += 1
     if self.zero_on_sample:
       zeros = [0.0] * len(self.items[key])
       self.prioritize(self.items[key], zeros)
     return key
+
+  def get_is_weight(self, key=None):
+    """Get IS weight for the last sampled key (or a specific key).
+
+    Returns w_i = (N * P(i))^(-β) / max_w, where P(i) is the sampling
+    probability of item i, N is the buffer size, and β is annealed.
+    Returns 1.0 if IS correction is disabled.
+    """
+    if not self.is_correction:
+      return 1.0
+    key = key or self._last_sampled_key
+    if key is None or not len(self):
+      return 1.0
+    N = len(self)
+    total = self.tree.root.uprob
+    if total <= 0 or not np.isfinite(total):
+      return 1.0
+    entry = self.tree.entries.get(key)
+    if entry is None:
+      return 1.0
+    prob = entry.uprob / total
+    if prob <= 0:
+      return 1.0
+    beta = self.beta
+    # w_i = (N * P(i))^(-β)
+    weight = (N * prob) ** (-beta)
+    # Normalize by max possible weight: max_w = (N * min_prob)^(-β)
+    # min_prob corresponds to the item with lowest priority.
+    # For efficiency, we just cap the weight at a reasonable maximum.
+    return min(weight, 1e4)
 
   def __setitem__(self, key, stepids):
     if not isinstance(stepids[0], bytes):
@@ -210,9 +263,21 @@ class Mixture:
     self.selectors = [selectors[key] for key in keys]
     self.fractions = np.array([fractions[key] for key in keys], np.float32)
     self.rng = np.random.default_rng(seed)
+    self._last_selector = None
+
+  def __len__(self):
+    return len(self.selectors[0]) if self.selectors else 0
 
   def __call__(self):
-    return self.rng.choice(self.selectors, p=self.fractions)()
+    idx = self.rng.choice(len(self.selectors), p=self.fractions)
+    self._last_selector = self.selectors[idx]
+    return self._last_selector()
+
+  def get_is_weight(self, key=None):
+    """Get IS weight from the last sampled selector."""
+    if self._last_selector and hasattr(self._last_selector, 'get_is_weight'):
+      return self._last_selector.get_is_weight(key)
+    return 1.0
 
   def __setitem__(self, key, stepids):
     for selector in self.selectors:

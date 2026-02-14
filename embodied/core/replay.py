@@ -121,9 +121,12 @@ class Replay:
   def sample(self, batch, mode='train'):
     message = f'Replay buffer {self.name} is empty'
     limiters.wait(lambda: len(self.sampler), message)
-    seqs, is_online = zip(*[self._sample(mode) for _ in range(batch)])
+    seqs, is_online, is_weights = zip(*[
+        self._sample(mode) for _ in range(batch)])
     data = self._assemble_batch(seqs, 0, self.length)
     data = self._annotate_batch(data, is_online, True)
+    # Add IS weights for prioritized replay (B, 1) for time broadcasting
+    data['is_weights'] = np.array(is_weights, np.float32)[:, None]
     return data
 
   @elements.timer.section('replay_update')
@@ -158,13 +161,19 @@ class Replay:
         if self.online and self.queue and mode == 'train':
           chunkid, index = self.queue.popleft()
           is_online = True
+          is_weight = 1.0
         else:
           with elements.timer.section('sample'):
             itemid = self.sampler()
           chunkid, index = self.items[itemid]
           is_online = False
+          # Get IS weight from the selector
+          if hasattr(self.sampler, 'get_is_weight'):
+            is_weight = self.sampler.get_is_weight(itemid)
+          else:
+            is_weight = 1.0
         seq = self._getseq(chunkid, index, concat=False)
-        return seq, is_online
+        return seq, is_online, is_weight
       except KeyError:
         continue
 
