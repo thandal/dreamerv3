@@ -64,7 +64,8 @@ class TestAgent:
     return (carry,), act, {}
 
   def train(self, carry, data):
-    expected = sorted(set(self.obs_space | self.act_space) | {'stepid'})
+    expected = sorted(
+        set(self.obs_space | self.act_space) | {'stepid', 'is_weights'})
     assert sorted(data.keys()) == expected, (sorted(data.keys()), expected)
     B, T = data['count'].shape
     carry, = carry
@@ -92,8 +93,8 @@ class TestAgent:
         'video': np.zeros((10, 64, 64, 3)),
     }
 
-  def dataset(self, generator):
-    return generator()
+  def stream(self, st):
+    return st
 
   def save(self):
     self._stats['saves'] += 1

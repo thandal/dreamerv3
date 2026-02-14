@@ -31,6 +31,7 @@ class TestParallel:
         bind(self._make_replay, args),
         self._make_env,
         self._make_env,
+        self._make_stream,
         self._make_logger, args)
 
     stats = received[0]
@@ -51,6 +52,7 @@ class TestParallel:
         bind(self._make_replay, args),
         self._make_env,
         self._make_env,
+        self._make_stream,
         self._make_logger, args)
     stats = received[0]
     assert stats['loads'] == 1
@@ -74,6 +76,11 @@ class TestParallel:
     return elements.Logger(elements.Counter(), [
         elements.logger.TerminalOutput(),
     ])
+
+  def _make_stream(self, replay, mode):
+    batch_size = 8
+    fn = bind(replay.sample, batch_size, mode)
+    return embodied.streams.Stateless(fn)
 
   def _make_args(self, logdir, train_ratio, eval_envs):
     return elements.Config(
