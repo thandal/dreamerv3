@@ -38,7 +38,7 @@ class TestReplay:
     for step in range(30):
       replay.add({'image': np.zeros((64, 64, 3)), 'action': np.zeros(12)})
     seq = next(unbatched(replay.dataset(1)))
-    assert set(seq.keys()) == {'stepid', 'image', 'action'}
+    assert set(seq.keys()) == {'stepid', 'image', 'action', 'is_weights'}
     assert seq['stepid'].shape == (5, 20)
     assert seq['image'].shape == (5, 64, 64, 3)
     assert seq['action'].shape == (5, 12)

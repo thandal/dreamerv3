@@ -129,6 +129,11 @@ class Replay:
     data['is_weights'] = np.array(is_weights, np.float32)[:, None]
     return data
 
+  def dataset(self, batch, mode='train'):
+    """Infinite iterator yielding batches from sample()."""
+    while True:
+      yield self.sample(batch, mode)
+
   @elements.timer.section('replay_update')
   def update(self, data):
     stepid = data.pop('stepid')
