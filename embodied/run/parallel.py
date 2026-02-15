@@ -102,7 +102,6 @@ def parallel_actor(agent, barrier, args):
     with elements.timer.section('put_states'):
       for i, a in enumerate(envid):
         carries[a] = elements.tree.map(lambda x: x[i], carry, isleaf=islist)
-    acts = {**acts, 'reset': obs['is_last'].copy()}
     trans = {'envid': envid, 'is_eval': is_eval, **obs, **acts, **outs, **logs}
     [x.setflags(write=False) for x in trans.values()]
     return acts, trans
