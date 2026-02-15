@@ -263,6 +263,9 @@ class Agent(embodied.Agent):
   @elements.timer.section('jaxagent_train')
   def train(self, carry, data):
     seed = data.pop('seed')
+    # Remove metadata keys that are not part of the training spaces
+    # - 'is_weights': importance sampling weights from prioritized replay
+    data.pop('is_weights', None)
     assert sorted(data.keys()) == sorted(self.spaces.keys()), (
         sorted(data.keys()), sorted(self.spaces.keys()))
     allo = {k: v for k, v in self.params.items() if k in self.policy_keys}
@@ -315,6 +318,9 @@ class Agent(embodied.Agent):
   @elements.timer.section('jaxagent_report')
   def report(self, carry, data):
     seed = data.pop('seed')
+    # Remove metadata keys that are not part of the training spaces
+    # - 'is_weights': importance sampling weights from prioritized replay
+    data.pop('is_weights', None)
     assert sorted(data.keys()) == sorted(self.spaces.keys()), (
         sorted(data.keys()), sorted(self.spaces.keys()))
     with self.train_lock:

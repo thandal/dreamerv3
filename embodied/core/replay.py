@@ -142,9 +142,10 @@ class Replay:
     self.metrics['updates'] += int(np.prod(stepid.shape[:-1]))
     if priority is not None:
       assert priority.ndim == 2, priority.shape
-      self.sampler.prioritize(
-          stepid.reshape((-1, stepid.shape[-1])),
-          priority.flatten())
+      if hasattr(self.sampler, 'prioritize'):
+        self.sampler.prioritize(
+            stepid.reshape((-1, stepid.shape[-1])),
+            priority.flatten())
     if data:
       for i, stepid in enumerate(stepid):
         stepid = stepid[0].tobytes()
