@@ -2,6 +2,18 @@ import importlib
 import os
 import pathlib
 import sys
+import threading
+import time
+import tracemalloc
+import gc
+try:
+  import psutil
+except ImportError:
+  psutil = None
+try:
+  import objgraph
+except ImportError:
+  objgraph = None
 from functools import partial as bind
 
 folder = pathlib.Path(__file__).parent
@@ -16,8 +28,49 @@ import portal
 import ruamel.yaml as yaml
 
 
+
+def monitor_memory(interval=60):
+  print(f"Starting memory monitor with interval {interval}s")
+  tracemalloc.start()
+  snapshot1 = tracemalloc.take_snapshot()
+  
+  while True:
+    time.sleep(interval)
+    print("-" * 40)
+    print(f"Memory Stats at {time.strftime('%H:%M:%S')}")
+    
+    if psutil:
+      try:
+        process = psutil.Process(os.getpid())
+        mem_info = process.memory_info()
+        print(f"RSS Memory: {mem_info.rss / 1024 / 1024:.2f} MB")
+        print(f"VMS Memory: {mem_info.vms / 1024 / 1024:.2f} MB")
+      except Exception as e:
+        print(f"Error getting psutil stats: {e}")
+    
+    print(f"GC Objects: {len(gc.get_objects())}")
+    print(f"Garbage: {len(gc.garbage)}")
+    
+    try:
+      snapshot2 = tracemalloc.take_snapshot()
+      top_stats = snapshot2.compare_to(snapshot1, 'lineno')
+      print("[ Top 10 Memory Differences ]")
+      for stat in top_stats[:10]:
+        print(stat)
+      snapshot1 = snapshot2
+    except Exception as e:
+      print(f"Error taking snapshot: {e}")
+
+    if objgraph:
+      print("[ Top 10 Growing Object Types ]")
+      objgraph.show_growth(limit=10)
+      
+    print("-" * 40)
+
+
 def main(argv=None):
   from .agent import Agent
+  threading.Thread(target=monitor_memory, args=(10,), daemon=True).start()
   [elements.print(line) for line in Agent.banner]
 
   configs = elements.Path(folder / 'configs.yaml').read()
