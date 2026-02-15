@@ -5,7 +5,7 @@ import elements
 import embodied
 import numpy as np
 import pytest
-import zerofun
+import portal
 from embodied.envs import dummy
 
 import utils
@@ -17,11 +17,12 @@ class TestParallel:
       (-1, 2), (1, 2), (1, 0), (32, 2),
   ))
   def test_run_loop(self, tmpdir, train_ratio, eval_envs):
-    addr = 'ipc:///tmp/teststats'
+    port = portal.free_port()
+    addr = f'localhost:{port}'
     received = deque(maxlen=1)
-    server = zerofun.Server(addr, name='TestStats')
+    server = portal.Server(addr, 'TestStats')
     server.bind('report', lambda stats: received.append(stats))
-    server.start()
+    server.start(block=False)
 
     args = self._make_args(tmpdir, train_ratio, eval_envs)
 
@@ -84,6 +85,7 @@ class TestParallel:
 
   def _make_args(self, logdir, train_ratio, eval_envs):
     return elements.Config(
+        steps=100,
         duration=5.0,
         train_ratio=float(train_ratio),
         log_every=0.1,
@@ -92,11 +94,12 @@ class TestParallel:
         envs=4,
         eval_envs=int(eval_envs),
         report_batches=1,
+        consec_report=1,
         from_checkpoint='',
         episode_timeout=10,
-        actor_addr='tcp://localhost:{auto}',
-        replay_addr='tcp://localhost:{auto}',
-        logger_addr='tcp://localhost:{auto}',
+        actor_addr='localhost:{auto}',
+        replay_addr='localhost:{auto}',
+        logger_addr='localhost:{auto}',
         ipv6=False,
         actor_batch=-1,
         actor_threads=2,

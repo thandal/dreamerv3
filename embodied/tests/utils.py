@@ -1,7 +1,7 @@
 import time
 
 import elements
-import zerofun
+import portal
 import numpy as np
 
 
@@ -11,7 +11,7 @@ class TestAgent:
     self.obs_space = obs_space
     self.act_space = act_space
     if addr:
-      self.client = zerofun.Client(addr, connect=True)
+      self.client = portal.Client(addr, 'TestAgent')
       self.should_stats = elements.when.Clock(1)
     else:
       self.client = None

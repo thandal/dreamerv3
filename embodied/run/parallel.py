@@ -56,7 +56,7 @@ def combined(
         parallel_replay, make_replay_train, make_replay_eval,
         make_stream, args))
 
-  portal.run(workers)
+  portal.run(workers, args.duration)
 
 
 def parallel_agent(make_agent, args):
@@ -102,9 +102,9 @@ def parallel_actor(agent, barrier, args):
     with elements.timer.section('put_states'):
       for i, a in enumerate(envid):
         carries[a] = elements.tree.map(lambda x: x[i], carry, isleaf=islist)
+    acts = {**acts, 'reset': obs['is_last'].copy()}
     trans = {'envid': envid, 'is_eval': is_eval, **obs, **acts, **outs, **logs}
     [x.setflags(write=False) for x in trans.values()]
-    acts = {**acts, 'reset': obs['is_last'].copy()}
     return acts, trans
 
   @elements.timer.section('donefn')
@@ -179,6 +179,13 @@ def parallel_learner(agent, barrier, args):
   stream_eval = iter(agent.stream(
       embodied.streams.Stateless(parallel_stream('eval'))))
   carry = agent.init_train(args.batch_size)
+
+  # Prime the report/eval streams by calling next() once.
+  # This increments received['report']/received['eval'] to allow
+  # should_report(skip=not received['report']) to succeed.
+  next(stream_report)
+  if args.eval_envs:
+    next(stream_eval)
 
   while True:
 
