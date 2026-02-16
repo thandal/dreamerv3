@@ -37,7 +37,7 @@ defaults:
     loconav: {size: [64, 64], repeat: 1, camera: -1}
 
   replay:
-    size: 5e6
+    size: 1e6 # 5e6 -- corresponds to ~100 Gb RAM.
     online: True
     fracs: {uniform: 1.0, priority: 0.0, recency: 0.0}
     # Prioritized replay (Schaul et al., 2016). Use fracs.priority to control
