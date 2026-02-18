@@ -88,13 +88,12 @@ defaults:
   # AGENT CONFIGURATION
   # ============================================================================
   # This section contains all design choices for the DreamerV3 agent.
-  # Many options are already configurable - see comments below for alternatives.
 
   agent:
-    # Loss scales (β coefficients) - Already configurable
+    # Loss scales (β coefficients)
     loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3}
 
-    # Optimizer parameters - Already configurable
+    # Optimizer parameters
     # Try: lr: 1e-4, 3e-5, etc. | agc: 0.1, 0.5 | beta1: 0.5, 0.9 | beta2: 0.99, 0.999
     opt: {lr: 4e-5, agc: 0.3, eps: 1e-20, beta1: 0.9, beta2: 0.999, momentum: True, wd: 0.0, schedule: const, warmup: 1000, anneal: 0}
     ac_grads: False
@@ -108,11 +107,11 @@ defaults:
         stoch: 32            # Number of stochastic variables
         classes: 64          # Classes per stochastic variable (for categorical)
 
-        # Activation function - Already configurable
+        # Activation function
         # Options: silu (default), relu, gelu, elu, swish, mish
         act: silu
 
-        # Normalization - Already configurable
+        # Normalization
         # Options: rms (default), layer, none
         norm: rms
 
@@ -126,7 +125,7 @@ defaults:
         blocks: 8            # Number of GRU blocks (block-diagonal structure)
         free_nats: 1.0       # Free nats for KL divergence
 
-        # Latent representation type - Already configurable (onehot, twohot, gaussian, vqvae)
+        # Latent representation type (onehot, twohot, gaussian, vqvae)
         # See 'twohot_latent', 'gaussian_latent', 'vqvae_latent' presets below
         latent: onehot
 
@@ -169,8 +168,7 @@ defaults:
       units: 1024
       act: silu
       norm: rms
-      # Output distribution - Already configurable
-      # Options: symexp_twohot (default), mse, twohot, symlog_mse
+      # Output distribution - symexp_twohot (default), mse, twohot, symlog_mse
       output: symexp_twohot
       outscale: 0.0
       winit: trunc_normal_in
@@ -204,13 +202,13 @@ defaults:
       units: 1024
       act: silu
       norm: rms
-      # Output distribution - Already configurable
+      # Output distribution
       output: symexp_twohot
       outscale: 0.0
       winit: trunc_normal_in
       bins: 255
 
-    # Policy distribution types - Already configurable
+    # Policy distribution types
     # Discrete: categorical (default), onehot
     # Continuous: bounded_normal (default), normal, tanh_normal
     policy_dist_disc: categorical
@@ -221,12 +219,16 @@ defaults:
     horizon: 333         # Planning horizon
     contdisc: True
 
+    # Imagination loss type: 'reinforce' (default DreamerV3) or 'pmpo' (DreamerV4-style)
+    imag_loss_type: reinforce
+
     # Actor-critic loss configuration
     imag_loss:
       slowtar: False     # Use slow target network
-      lam: 0.95          # TD(λ) parameter - Already configurable
+      lam: 0.95          # TD(λ) parameter
       actent: 3e-4       # Action entropy coefficient
       slowreg: 1.0
+      pmpo_alpha: 0.5    # PMPO: balance between D+ and D- sets (only used when imag_loss_type=pmpo)
 
     repl_loss:
       slowtar: False
@@ -237,7 +239,7 @@ defaults:
       rate: 0.02         # Slow value network update rate
       every: 1
 
-    # Return normalization - Already configurable
+    # Return normalization
     # Options: impl: perc (percentile), meanstd (mean/std), none
     retnorm: {impl: perc, rate: 0.01, limit: 1.0, perclo: 5.0, perchi: 95.0, debias: False}
     valnorm: {impl: none, rate: 0.01, limit: 1e-8}
@@ -364,3 +366,12 @@ vqvae_latent:
   agent:
     dyn:
       rssm: {latent: vqvae}
+
+pmpo:
+  agent:
+    imag_loss_type: pmpo
+    imag_loss:
+      actent: 0.3  # From Dreaverv4 paper
+    # PMPO is scale-invariant, so disable return/advantage normalization
+    retnorm: {impl: none, rate: 0.01, limit: 1e-8}
+    advnorm: {impl: none, rate: 0.01, limit: 1e-8}

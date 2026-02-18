@@ -285,7 +285,9 @@ class Agent(embodied.jax.Agent):
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
     inp = self.feat2tensor(imgfeat)
-    los, imgloss_out, mets = imag_loss(
+    imag_loss_fn = imag_loss_pmpo if getattr(
+        self.config, 'imag_loss_type', 'reinforce') == 'pmpo' else imag_loss
+    los, imgloss_out, mets = imag_loss_fn(
         imgact,
         self.rew(inp, 2).pred(),
         self.con(inp, 2).prob(1),
@@ -528,6 +530,105 @@ def imag_loss(
   metrics['ret_min'] = ret_normed.min()
   metrics['ret_max'] = ret_normed.max()
   metrics['ret_rate'] = (jnp.abs(ret_normed) >= 1.0).mean()
+  for k in act:
+    metrics[f'ent/{k}'] = ents[k].mean()
+    if hasattr(policy[k], 'minent'):
+      lo, hi = policy[k].minent, policy[k].maxent
+      metrics[f'rand/{k}'] = (ents[k].mean() - lo) / (hi - lo)
+
+  outs = {}
+  outs['ret'] = ret
+  return losses, outs, metrics
+
+
+def imag_loss_pmpo(
+    act, rew, con,
+    policy, value, slowvalue,
+    retnorm, valnorm, advnorm,
+    update,
+    contdisc=True,
+    slowtar=True,
+    horizon=333,
+    lam=0.95,
+    actent=3e-4,
+    slowreg=1.0,
+    pmpo_alpha=0.5,
+):
+  """PMPO policy loss (DreamerV4-style).
+
+  Instead of weighting log-probs by advantage magnitude, PMPO splits states
+  into D+ (positive advantage) and D- (negative advantage) and separately
+  averages log-likelihood over each set. This makes the objective invariant
+  to reward scale.
+
+  L = (1-α) · mean_{D-}[log π] − α · mean_{D+}[log π]  +  entropy bonus
+  """
+  losses = {}
+  metrics = {}
+
+  # Value denormalization
+  voffset, vscale = valnorm.stats()
+  val = value.pred() * vscale + voffset
+  slowval = slowvalue.pred() * vscale + voffset
+  tarval = slowval if slowtar else val
+  disc = 1 if contdisc else 1 - 1 / horizon
+  weight = jnp.cumprod(disc * con, 1) / disc
+  last = jnp.zeros_like(con)
+  term = 1 - con
+  ret = lambda_return(last, term, rew, tarval, tarval, disc, lam)
+
+  # Advantages (unnormalized — PMPO only uses sign)
+  roffset, rscale = retnorm(ret, update)
+  adv = ret - tarval[:, :-1]
+
+  # Log-probs and entropy
+  logpi = sum([v.logp(sg(act[k]))[:, :-1] for k, v in policy.items()])
+  ents = {k: v.entropy()[:, :-1] for k, v in policy.items()}
+
+  # PMPO: split by advantage sign and average separately
+  w = sg(weight[:, :-1])
+  pos_mask = f32(adv > 0)
+  neg_mask = f32(adv <= 0)
+  pos_count = jnp.maximum(pos_mask.sum(), 1.0)
+  neg_count = jnp.maximum(neg_mask.sum(), 1.0)
+  # Increase log-prob for positive advantage, decrease for negative
+  pos_loss = -(w * logpi * pos_mask).sum() / pos_count
+  neg_loss = (w * logpi * neg_mask).sum() / neg_count
+  ent_loss = -(w * actent * sum(ents.values())).mean()
+  # Broadcast back to per-element shape for compatibility
+  policy_loss = (
+      pmpo_alpha * pos_loss + (1 - pmpo_alpha) * neg_loss + ent_loss)
+  # Expand to (B, H) to match expected shape
+  policy_loss_expanded = jnp.broadcast_to(
+      policy_loss / w.size, w.shape)
+  # Scale up so .mean() recovers original total
+  losses['policy'] = policy_loss_expanded * w.size
+
+  # Value loss (identical to reinforce version)
+  voffset, vscale = valnorm(ret, update)
+  tar_normed = (ret - voffset) / vscale
+  tar_padded = jnp.concatenate([tar_normed, 0 * tar_normed[:, -1:]], 1)
+  losses['value'] = sg(weight[:, :-1]) * (
+      value.loss(sg(tar_padded)) +
+      slowreg * value.loss(sg(slowvalue.pred())))[:, :-1]
+
+  # Metrics
+  ret_normed = (ret - roffset) / rscale
+  adv_normed = adv / jnp.maximum(rscale, 1e-8)
+  metrics['adv'] = adv_normed.mean()
+  metrics['adv_std'] = adv_normed.std()
+  metrics['adv_mag'] = jnp.abs(adv_normed).mean()
+  metrics['rew'] = rew.mean()
+  metrics['con'] = con.mean()
+  metrics['ret'] = ret_normed.mean()
+  metrics['val'] = val.mean()
+  metrics['tar'] = tar_normed.mean()
+  metrics['weight'] = weight.mean()
+  metrics['slowval'] = slowval.mean()
+  metrics['ret_min'] = ret_normed.min()
+  metrics['ret_max'] = ret_normed.max()
+  metrics['ret_rate'] = (jnp.abs(ret_normed) >= 1.0).mean()
+  metrics['pmpo_pos_frac'] = pos_mask.mean()
   for k in act:
     metrics[f'ent/{k}'] = ents[k].mean()
     if hasattr(policy[k], 'minent'):
