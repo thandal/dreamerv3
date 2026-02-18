@@ -39,10 +39,10 @@ defaults:
   replay:
     size: 1e6 # 5e6 -- corresponds to ~100 Gb RAM.
     online: True
-    fracs: {uniform: 1.0, priority: 0.0, recency: 0.0}
     # Prioritized replay (Schaul et al., 2016). Use fracs.priority to control
     # prioritization strength (e.g. 0.5 = half prioritized, half uniform).
-    prio: {exponent: 1.0, maxfrac: 0.5, initial: inf, zero_on_sample: True, is_correction: False, beta0: 0.4, beta_frames: 1e7}
+    fracs: {uniform: 1.0, priority: 0.0, recency: 0.0}
+    prio: {exponent: 0.8, maxfrac: 0.5, initial: inf, zero_on_sample: True, is_correction: False, beta0: 0.4, beta_frames: 1e7}
     priosignal: model
     recexp: 1.0
     chunksize: 1024
