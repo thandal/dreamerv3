@@ -93,6 +93,14 @@ class ActorCritic(nj.Module):
     self.pol = embodied.jax.MLPHead(
         act_space, outs, **config.policy, name='pol')
 
+    # Behavioral cloning prior policy (for PMPO with KL regularization)
+    if getattr(config, 'imag_loss_type', 'reinforce') == 'pmpo':
+      bc_kw = config.bc_policy if hasattr(config, 'bc_policy') else config.policy
+      self.bc_pol = embodied.jax.MLPHead(
+          act_space, outs, **bc_kw, name='bc_pol')
+    else:
+      self.bc_pol = None
+
     scalar = elements.Space(np.float32, ())
     self.val = embodied.jax.MLPHead(scalar, **config.value, name='val')
     self.slowval = embodied.jax.SlowModel(
@@ -135,6 +143,7 @@ class Agent(embodied.jax.Agent):
     self.scales = self.wm.scales
 
     self.pol = self.ac.pol
+    self.bc_pol = self.ac.bc_pol
     self.val = self.ac.val
     self.slowval = self.ac.slowval
     self.retnorm = self.ac.retnorm
@@ -143,6 +152,8 @@ class Agent(embodied.jax.Agent):
 
     self.modules = [
         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+    if self.bc_pol is not None:
+      self.modules.append(self.bc_pol)
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
@@ -224,7 +235,7 @@ class Agent(embodied.jax.Agent):
     if losses_raw:
       # Compute per-sequence priority as mean loss over time
       # Use total scaled model loss as priority (analogous to TD error)
-      model_keys = [k for k in losses_raw if k not in ('policy', 'value', 'repval')]
+      model_keys = [k for k in losses_raw if k not in ('policy', 'value', 'repval', 'bc_loss')]
       if model_keys:
         prio = sum(
             losses_raw[k].mean(-1) * self.scales[k]
@@ -270,6 +281,15 @@ class Agent(embodied.jax.Agent):
     shapes = {k: v.shape for k, v in losses.items()}
     assert all(x == (B, T) for x in shapes.values()), ((B, T), shapes)
 
+    # Behavioral cloning loss: train bc_pol on replay actions (supervised)
+    if self.bc_pol is not None:
+      bc_inp = sg(self.feat2tensor(repfeat))
+      bc_dists = self.bc_pol(bc_inp, 2)
+      losses['bc_loss'] = sum(
+          -bc_dists[k].logp(sg(prevact[k])) for k in self.act_space)
+    else:
+      losses['bc_loss'] = jnp.zeros((B, T))
+
     # Imagination
     K = min(self.config.imag_last or T, T)
     H = self.config.imag_length
@@ -287,6 +307,10 @@ class Agent(embodied.jax.Agent):
     inp = self.feat2tensor(imgfeat)
     imag_loss_fn = imag_loss_pmpo if getattr(
         self.config, 'imag_loss_type', 'reinforce') == 'pmpo' else imag_loss
+    # Build extra kwargs for PMPO (bc_policy)
+    imag_extra = {}
+    if imag_loss_fn is imag_loss_pmpo and self.bc_pol is not None:
+      imag_extra['bc_policy'] = self.bc_pol(sg(inp), 2)
     los, imgloss_out, mets = imag_loss_fn(
         imgact,
         self.rew(inp, 2).pred(),
@@ -298,7 +322,8 @@ class Agent(embodied.jax.Agent):
         update=training,
         contdisc=self.config.contdisc,
         horizon=self.config.horizon,
-        **self.config.imag_loss)
+        **self.config.imag_loss,
+        **imag_extra)
     losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()})
     metrics.update(mets)
 
@@ -485,6 +510,7 @@ def imag_loss(
     lam=0.95,
     actent=3e-4,
     slowreg=1.0,
+    **_kw,  # absorb PMPO-specific params (pmpo_alpha, pmpo_beta, etc.)
 ):
   losses = {}
   metrics = {}
@@ -553,6 +579,8 @@ def imag_loss_pmpo(
     actent=3e-4,
     slowreg=1.0,
     pmpo_alpha=0.5,
+    pmpo_beta=0.3,
+    bc_policy=None,
 ):
   """PMPO policy loss (DreamerV4-style).
 
@@ -561,7 +589,9 @@ def imag_loss_pmpo(
   averages log-likelihood over each set. This makes the objective invariant
   to reward scale.
 
-  L = (1-α) · mean_{D-}[log π] − α · mean_{D+}[log π]  +  entropy bonus
+  L = (1-α) · mean_{D-}[log π] − α · mean_{D+}[log π]
+      + actent · entropy
+      + β · KL(π_θ ‖ π_BC)    [reverse KL to behavioral cloning prior]
   """
   losses = {}
   metrics = {}
@@ -595,9 +625,17 @@ def imag_loss_pmpo(
   pos_loss = -(w * logpi * pos_mask).sum() / pos_count
   neg_loss = (w * logpi * neg_mask).sum() / neg_count
   ent_loss = -(w * actent * sum(ents.values())).mean()
+  # Reverse KL to behavioral cloning prior: KL(π_θ || π_BC)
+  if bc_policy is not None and pmpo_beta > 0:
+    kl_bc = sum([policy[k].kl(bc_policy[k])[:, :-1] for k in policy])
+    kl_term = (w * kl_bc).mean()
+    metrics['pmpo_kl_bc'] = kl_term
+  else:
+    kl_term = 0.0
   # Broadcast back to per-element shape for compatibility
   policy_loss = (
-      pmpo_alpha * pos_loss + (1 - pmpo_alpha) * neg_loss + ent_loss)
+      pmpo_alpha * pos_loss + (1 - pmpo_alpha) * neg_loss
+      + ent_loss + pmpo_beta * kl_term)
   # Expand to (B, H) to match expected shape
   policy_loss_expanded = jnp.broadcast_to(
       policy_loss / w.size, w.shape)

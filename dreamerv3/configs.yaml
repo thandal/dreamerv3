@@ -91,7 +91,7 @@ defaults:
 
   agent:
     # Loss scales (β coefficients)
-    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3}
+    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, bc_loss: 0.0}
 
     # Optimizer parameters
     # Try: lr: 1e-4, 3e-5, etc. | agc: 0.1, 0.5 | beta1: 0.5, 0.9 | beta2: 0.99, 0.999
@@ -196,6 +196,18 @@ defaults:
       unimix: 0.01
       winit: trunc_normal_in
 
+    # Behavioral cloning policy (used as PMPO prior, same defaults as policy)
+    bc_policy:
+      layers: 3
+      units: 1024
+      act: silu
+      norm: rms
+      minstd: 0.1
+      maxstd: 1.0
+      outscale: 0.01
+      unimix: 0.01
+      winit: trunc_normal_in
+
     # Value network
     value:
       layers: 3
@@ -229,6 +241,7 @@ defaults:
       actent: 3e-4       # Action entropy coefficient
       slowreg: 1.0
       pmpo_alpha: 0.5    # PMPO: balance between D+ and D- sets (only used when imag_loss_type=pmpo)
+      pmpo_beta: 0.3     # PMPO: reverse KL to BC prior strength (only used when imag_loss_type=pmpo)
 
     repl_loss:
       slowtar: False
@@ -370,8 +383,7 @@ vqvae_latent:
 pmpo:
   agent:
     imag_loss_type: pmpo
-    imag_loss:
-      actent: 0.3  # From Dreaverv4 paper
+    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, bc_loss: 1.0}
     # PMPO is scale-invariant, so disable return/advantage normalization
     retnorm: {impl: none, rate: 0.01, limit: 1e-8}
     advnorm: {impl: none, rate: 0.01, limit: 1e-8}

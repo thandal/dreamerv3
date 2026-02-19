@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 # ---------------------------------------------------------------------------
 
 class MockPolicyDist:
-  """Mock policy distribution with logp/entropy."""
+  """Mock policy distribution with logp/entropy/kl."""
 
   def __init__(self, logits):
     self._logits = logits  # (B, T, A)
@@ -26,6 +26,10 @@ class MockPolicyDist:
 
   def entropy(self):
     return jnp.ones(self._logits.shape[:2]) * 0.5
+
+  def kl(self, other):
+    """Approximate KL as sum of squared differences of logits."""
+    return jnp.square(self._logits - other._logits).sum(-1)
 
 
 class MockValueDist:
@@ -69,6 +73,13 @@ def _make_inputs(B=4, H=8, seed=0):
       update=False, contdisc=True, horizon=333,
       lam=0.95, actent=3e-4, slowreg=1.0,
   )
+
+
+def _make_bc_policy(B=4, H=8, seed=99):
+  """Create a separate BC policy for testing KL term."""
+  rng = np.random.RandomState(seed)
+  bc_logits = jnp.array(rng.randn(B, H + 1, 3).astype(np.float32))
+  return {'action': MockPolicyDist(bc_logits)}
 
 
 # ---------------------------------------------------------------------------
@@ -189,3 +200,75 @@ class TestImagLossPMPO:
                 'ret_min', 'ret_max', 'ret_rate', 'pmpo_pos_frac',
                 'ent/action']:
       assert key in metrics, f'Missing metric: {key}'
+
+
+class TestImagLossPMPO_BCPrior:
+  """Tests for the PMPO BC prior KL regularization term."""
+
+  def test_bc_kl_metric_present(self):
+    """When bc_policy is provided, should report pmpo_kl_bc metric."""
+    from dreamerv3.agent import imag_loss_pmpo
+    inputs = _make_inputs(seed=10)
+    inputs['bc_policy'] = _make_bc_policy(seed=20)
+    inputs['pmpo_beta'] = 0.3
+    _, _, metrics = imag_loss_pmpo(**inputs)
+    assert 'pmpo_kl_bc' in metrics
+    assert float(metrics['pmpo_kl_bc']) >= 0.0
+
+  def test_bc_kl_no_metric_when_beta_zero(self):
+    """When pmpo_beta=0, KL metric should not appear."""
+    from dreamerv3.agent import imag_loss_pmpo
+    inputs = _make_inputs(seed=10)
+    inputs['bc_policy'] = _make_bc_policy(seed=20)
+    inputs['pmpo_beta'] = 0.0
+    _, _, metrics = imag_loss_pmpo(**inputs)
+    assert 'pmpo_kl_bc' not in metrics
+
+  def test_bc_kl_changes_policy_loss(self):
+    """Adding BC prior KL should change the policy loss vs no BC prior."""
+    from dreamerv3.agent import imag_loss_pmpo
+    # Without BC prior
+    inputs_no_bc = _make_inputs(seed=42)
+    inputs_no_bc['pmpo_beta'] = 0.3
+    l_no_bc, _, _ = imag_loss_pmpo(**inputs_no_bc)
+
+    # With BC prior (different logits → nonzero KL)
+    inputs_bc = _make_inputs(seed=42)
+    inputs_bc['bc_policy'] = _make_bc_policy(seed=77)
+    inputs_bc['pmpo_beta'] = 0.3
+    l_bc, _, _ = imag_loss_pmpo(**inputs_bc)
+
+    assert not np.allclose(l_no_bc['policy'], l_bc['policy']), \
+        'BC prior KL should change the policy loss'
+
+  def test_bc_kl_zero_when_same_policy(self):
+    """KL should be zero when bc_policy == policy (same logits)."""
+    from dreamerv3.agent import imag_loss_pmpo
+    inputs = _make_inputs(seed=42)
+    # Use the same policy as BC prior → KL should be 0
+    inputs['bc_policy'] = inputs['policy']
+    inputs['pmpo_beta'] = 0.3
+    _, _, metrics = imag_loss_pmpo(**inputs)
+    np.testing.assert_allclose(
+        float(metrics['pmpo_kl_bc']), 0.0, atol=1e-6,
+        err_msg='KL between identical policies should be zero')
+
+  def test_bc_kl_scale_invariance_preserved(self):
+    """Scale invariance should hold even with BC prior (KL doesn't depend on rewards)."""
+    from dreamerv3.agent import imag_loss_pmpo
+    inputs1 = _make_inputs(seed=42)
+    inputs1['bc_policy'] = _make_bc_policy(seed=77)
+    inputs1['pmpo_beta'] = 0.3
+
+    inputs2 = _make_inputs(seed=42)
+    inputs2['bc_policy'] = _make_bc_policy(seed=77)
+    inputs2['pmpo_beta'] = 0.3
+    inputs2['rew'] = inputs2['rew'] * 100.0
+
+    l1, _, _ = imag_loss_pmpo(**inputs1)
+    l2, _, _ = imag_loss_pmpo(**inputs2)
+
+    np.testing.assert_allclose(
+        l1['policy'], l2['policy'], rtol=1e-5,
+        err_msg='PMPO + BC prior should still be scale-invariant')
+
