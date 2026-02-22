@@ -106,6 +106,19 @@ Or search through instances, and use and INSTANCE_NUMBER:
 vast create instance INSTANCE_NUMBER --disk 32 --image than6785/dreamer:n1 --env "WANDB_API_KEY=your_api_key" --onstart-cmd "sh entrypoint.sh python dreamerv3/main.py --logdir /logdir/dmc_vision_size1m/{timestamp} --configs dmc_vision size1m"
 ```
 
+
+# JAX Profile
+
+Install tensorflow and xprof
+```sh
+pip install tensorflow xprof
+```
+
+Run xprof with a given log directory
+```sh
+xprof ~/logdir/experiment/timestamp/
+```
+
 # Tips
 
 - All config options are listed in `dreamerv3/configs.yaml` and you can
