@@ -87,6 +87,25 @@ python -m scope.viewer --basedir ~/logdir --port 8000
 
 Scalar metrics are also writting as JSONL files.
 
+
+## Vast.ai
+
+```sh
+docker build -f Dockerfile-base -t than6785/dreamer-base .
+docker push than6785/dreamer-base 
+docker build -f Dockerfile -t than6785/dreamer:n1 .
+docker push than6785/dreamer:n1 .
+```
+
+Then to launch with the first matching instance:
+```sh
+vast launch instance -g RTX_5070 --num-gpus 1 --disk 32.0 --image than6785/dreamer:n1 --env "WANDB_API_KEY=your_api_key" --onstart-cmd "sh entrypoint.sh python dreamerv3/main.py --logdir /logdir/dmc_vision_size1m/{timestamp} --configs dmc_vision size1m"
+```
+Or search through instances, and use and INSTANCE_NUMBER:
+```sh 
+vast create instance INSTANCE_NUMBER --disk 32 --image than6785/dreamer:n1 --env "WANDB_API_KEY=your_api_key" --onstart-cmd "sh entrypoint.sh python dreamerv3/main.py --logdir /logdir/dmc_vision_size1m/{timestamp} --configs dmc_vision size1m"
+```
+
 # Tips
 
 - All config options are listed in `dreamerv3/configs.yaml` and you can
