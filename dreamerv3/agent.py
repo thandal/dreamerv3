@@ -619,8 +619,8 @@ def imag_loss_pmpo(
   w = sg(weight[:, :-1])
   pos_mask = f32(adv > 0)
   neg_mask = f32(adv <= 0)
-  pos_count = jnp.maximum(pos_mask.sum(), 1.0)
-  neg_count = jnp.maximum(neg_mask.sum(), 1.0)
+  pos_count = jnp.maximum((w * pos_mask).sum(), 1e-8)
+  neg_count = jnp.maximum((w * neg_mask).sum(), 1e-8)
   # Increase log-prob for positive advantage, decrease for negative
   pos_loss = -(w * logpi * pos_mask).sum() / pos_count
   neg_loss = (w * logpi * neg_mask).sum() / neg_count

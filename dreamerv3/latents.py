@@ -115,7 +115,7 @@ class TwoHotLatent(LatentBase):
         Returns:
             Custom distribution object
         """
-        return TwoHotDist(logits, self.stoch, self.classes)
+        return TwoHotDist(logits, self.stoch, self.classes, self.unimix)
 
     def get_shape(self):
         return (self.stoch, self.classes)
@@ -124,32 +124,50 @@ class TwoHotLatent(LatentBase):
 class TwoHotDist:
     """Distribution for two-hot encoding with straight-through gradients."""
 
-    def __init__(self, logits, stoch, classes):
+    def __init__(self, logits, stoch, classes, unimix=0.0):
         self.logits = f32(logits)
         self.stoch = stoch
         self.classes = classes
+        self.unimix = unimix
+        # Apply unimix regularization (same as Categorical)
+        probs = jax.nn.softmax(self.logits, -1)
+        if unimix:
+            uniform = jnp.ones_like(probs) / probs.shape[-1]
+            probs = (1 - unimix) * probs + unimix * uniform
+        self._probs = probs
 
     def sample(self, seed):
-        """Sample using two-hot encoding."""
-        # Get probabilities
-        probs = jax.nn.softmax(self.logits, -1)
+        """Sample using stochastic two-hot encoding.
 
-        # Compute weighted average position
+        Samples a categorical index, then constructs a two-hot vector
+        by spreading weight between the sampled bin and a neighbor
+        (determined by the expected position's fractional part).
+        Uses straight-through gradients from the underlying probs.
+        """
+        probs = self._probs
+
+        # Stochastic sampling: draw a categorical index
+        idx = jax.random.categorical(seed, jnp.log(probs), -1)  # (..., stoch)
+
+        # Compute expected position from probs to determine neighbor direction
         bins = jnp.arange(self.classes, dtype=f32)
-        pos = (probs * bins).sum(-1)  # Shape: (..., stoch)
+        expected_pos = (probs * bins).sum(-1)  # (..., stoch)
 
-        # Convert to two-hot
-        below = jnp.floor(pos).astype(jnp.int32)
-        above = below + 1
-        below = jnp.clip(below, 0, self.classes - 1)
-        above = jnp.clip(above, 0, self.classes - 1)
+        # Determine neighbor: if expected position > sampled index, neighbor
+        # is above; otherwise below. Clamp to valid range.
+        idx_f = idx.astype(f32)
+        go_up = expected_pos >= idx_f
+        neighbor = jnp.where(go_up, idx + 1, idx - 1)
+        neighbor = jnp.clip(neighbor, 0, self.classes - 1)
 
-        weight_above = pos - below.astype(f32)
-        weight_below = 1.0 - weight_above
+        # Fractional weight between idx and neighbor based on expected position
+        frac = jnp.abs(expected_pos - idx_f)
+        frac = jnp.clip(frac, 0.0, 1.0)
 
+        # Construct two-hot: (1-frac) on sampled bin + frac on neighbor
         stoch = (
-            jax.nn.one_hot(below, self.classes) * weight_below[..., None] +
-            jax.nn.one_hot(above, self.classes) * weight_above[..., None]
+            jax.nn.one_hot(idx, self.classes) * (1.0 - frac)[..., None] +
+            jax.nn.one_hot(neighbor, self.classes) * frac[..., None]
         )
 
         # Straight-through gradient from probs
@@ -157,24 +175,21 @@ class TwoHotDist:
 
     def logp(self, event):
         """Log probability (treat as categorical)."""
-        # Approximate by treating two-hot as soft one-hot
-        logprob = jax.nn.log_softmax(self.logits, -1)
+        logprob = jnp.log(self._probs)
         return (logprob * event).sum(-1).sum(-1)  # Sum over classes and stoch
 
     def entropy(self):
         """Entropy of the underlying categorical distribution."""
-        logprob = jax.nn.log_softmax(self.logits, -1)
-        prob = jax.nn.softmax(self.logits, -1)
-        entropy = -(prob * logprob).sum(-1)  # Per stoch variable
+        logprob = jnp.log(self._probs)
+        entropy = -(self._probs * logprob).sum(-1)  # Per stoch variable
         return entropy.sum(-1)  # Sum over stoch dimension
 
     def kl(self, other):
         """KL divergence between two-hot distributions."""
         assert isinstance(other, TwoHotDist), other
-        logprob = jax.nn.log_softmax(self.logits, -1)
-        logother = jax.nn.log_softmax(other.logits, -1)
-        prob = jax.nn.softmax(self.logits, -1)
-        kl = (prob * (logprob - logother)).sum(-1)  # Per stoch variable
+        logprob = jnp.log(self._probs)
+        logother = jnp.log(other._probs)
+        kl = (self._probs * (logprob - logother)).sum(-1)  # Per stoch variable
         return kl.sum(-1)  # Sum over stoch dimension
 
 
