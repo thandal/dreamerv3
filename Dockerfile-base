@@ -1,6 +1,16 @@
 # Base docker image with all the requirements for Dreamerv3n
-# docker build -f Dockerfile-base -t than6785/dreamer-base .
-# docker push than6785/dreamer-base 
+#  docker build -f Dockerfile-base -t than6785/dreamer-base .
+#  docker push than6785/dreamer-base 
+
+# Can make patches live by using
+#  docker run -it than6785/dreamer-base .
+# making the edits, and then while the container is still running
+#  docker commit CONTAINER_ID than6785/dreamer-base:patched
+
+# TODO: remove this once the patches are upstream.
+# Patch 1: ninjax (comment out noisy print)
+# Patch 2: elements/logger.py (wandb video of single channel images)
+
 
 FROM ubuntu:24.04
 #FROM vastai/ubuntu-ssh
@@ -38,3 +48,6 @@ RUN pip install dm_control
 ##RUN apt-get update && apt-get install -y openjdk-8-jdk && apt-get clean
 ##RUN pip install https://github.com/danijar/minerl/releases/download/v0.4.4-patched/minerl_mirror-0.4.4-cp311-cp311-linux_x86_64.whl
 ##RUN chown -R 1000:root /venv/lib/python3.11/site-packages/minerl
+
+# For vast
+RUN pip install vastai

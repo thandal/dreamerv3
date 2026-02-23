@@ -2,7 +2,7 @@
 
 # docker run -it --gpus all --rm -v ~/logdir/docker:/logdir than6785/zd:dreamer1 python dreamerv3/main.py --logdir /logdir/{timestamp} --configs dmc_vision size1m 
 
-FROM than6785/dreamer-base
+FROM than6785/dreamer-base:patched
 
 # Envs
 ##RUN wget -O - https://gist.githubusercontent.com/danijar/ca6ab917188d2e081a8253b3ca5c36d3/raw/install-dmlab.sh | sh
