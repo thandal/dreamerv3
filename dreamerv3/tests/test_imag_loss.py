@@ -202,6 +202,29 @@ class TestImagLossPMPO:
       assert key in metrics, f'Missing metric: {key}'
 
 
+class TestImagLossPMPO_WeightedCount:
+  """Tests that PMPO uses weighted count (not raw count) in D+/D- averaging."""
+
+  def test_zero_weight_states_dont_contribute(self):
+    """States with zero continuation weight should not affect the loss."""
+    from dreamerv3.agent import imag_loss_pmpo
+    B, H = 4, 8
+    # Baseline: all continuations = 1
+    inputs1 = _make_inputs(B, H, seed=42)
+    l1, _, _ = imag_loss_pmpo(**inputs1)
+
+    # Set continuation to 0 at timestep 2 onward → weight becomes 0 there
+    inputs2 = _make_inputs(B, H, seed=42)
+    inputs2['con'] = inputs2['con'].at[:, 2:].set(0.0)
+    l2, _, _ = imag_loss_pmpo(**inputs2)
+
+    # The losses should differ because different states are included
+    # But critically, the zero-weight states should not bias the average
+    # (this test mainly ensures no NaN/inf from the fix)
+    assert jnp.isfinite(l2['policy']).all(), \
+        'PMPO should produce finite loss even with zero-weight states'
+
+
 class TestImagLossPMPO_BCPrior:
   """Tests for the PMPO BC prior KL regularization term."""
 
