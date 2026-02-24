@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from dreamerv3.latents import (
     create_latent, OneHotLatent, TwoHotLatent, TwoHotDist,
+    VQVAELatent, VQVAEDist,
 )
 
 
@@ -135,3 +136,132 @@ class TestCreateLatent:
     def test_unknown_type_raises(self):
         with pytest.raises(ValueError, match='Unknown latent type'):
             create_latent('nonexistent', STOCH, CLASSES)
+
+    def test_creates_vqvae(self):
+        latent = create_latent('vqvae', STOCH, CLASSES, unimix=0.01)
+        assert isinstance(latent, VQVAELatent)
+        assert latent.unimix == 0.01
+
+
+class TestVQVAEDist:
+
+    def test_sample_shape(self):
+        """Sample shape should be (B, stoch, classes)."""
+        logits = _make_logits()
+        dist = VQVAEDist(logits, STOCH, CLASSES)
+        s = dist.sample(jax.random.PRNGKey(0))
+        assert s.shape == (B, STOCH, CLASSES)
+
+    def test_sample_is_onehot(self):
+        """Each sample should be one-hot (exactly one 1 per stoch variable)."""
+        logits = _make_logits()
+        dist = VQVAEDist(logits, STOCH, CLASSES, unimix=0.01)
+        s = dist.sample(jax.random.PRNGKey(0))
+        # Forward pass should sum to ~1 per stoch var (ST term sums to 0)
+        sums = s.sum(-1)
+        np.testing.assert_allclose(sums, 1.0, atol=1e-5)
+
+    def test_sample_is_deterministic(self):
+        """Argmax sampling should be deterministic across seeds."""
+        logits = _make_logits()
+        dist = VQVAEDist(logits, STOCH, CLASSES)
+        s1 = dist.sample(jax.random.PRNGKey(0))
+        s2 = dist.sample(jax.random.PRNGKey(42))
+        # Hard part should be identical (argmax doesn't use seed)
+        np.testing.assert_allclose(s1, s2, atol=1e-6)
+
+    def test_unimix_prevents_zero_prob(self):
+        """With unimix > 0, no probability should be exactly zero."""
+        logits = jnp.zeros((B, STOCH, CLASSES))
+        logits = logits.at[..., 0].set(100.0)
+        unimix = 0.01
+        dist = VQVAEDist(logits, STOCH, CLASSES, unimix=unimix)
+        min_prob = dist._probs.min()
+        expected_min = unimix / CLASSES
+        assert float(min_prob) >= expected_min * 0.99, \
+            f'Min prob {min_prob} should be >= ~{expected_min} with unimix={unimix}'
+
+    def test_kl_nonnegative(self):
+        """KL divergence should be >= 0."""
+        logits_p = _make_logits(seed=0)
+        logits_q = _make_logits(seed=1)
+        dist_p = VQVAEDist(logits_p, STOCH, CLASSES, unimix=0.01)
+        dist_q = VQVAEDist(logits_q, STOCH, CLASSES, unimix=0.01)
+        kl = dist_p.kl(dist_q)
+        assert (kl >= -1e-6).all(), f'KL should be non-negative, got min={kl.min()}'
+
+    def test_kl_self_is_zero(self):
+        """KL(p || p) should be 0."""
+        logits = _make_logits()
+        dist = VQVAEDist(logits, STOCH, CLASSES, unimix=0.01)
+        kl = dist.kl(dist)
+        np.testing.assert_allclose(kl, 0.0, atol=1e-6)
+
+    def test_kl_shape(self):
+        """KL should have batch shape only (summed over stoch)."""
+        logits_p = _make_logits(seed=0)
+        logits_q = _make_logits(seed=1)
+        dist_p = VQVAEDist(logits_p, STOCH, CLASSES)
+        dist_q = VQVAEDist(logits_q, STOCH, CLASSES)
+        kl = dist_p.kl(dist_q)
+        assert kl.shape == (B,)
+
+    def test_entropy_nonnegative(self):
+        """Entropy should be >= 0."""
+        logits = _make_logits()
+        dist = VQVAEDist(logits, STOCH, CLASSES, unimix=0.01)
+        ent = dist.entropy()
+        assert (ent >= -1e-6).all(), f'Entropy should be non-negative, got min={ent.min()}'
+
+    def test_entropy_shape(self):
+        """Entropy should have batch shape only (summed over stoch)."""
+        logits = _make_logits()
+        dist = VQVAEDist(logits, STOCH, CLASSES)
+        ent = dist.entropy()
+        assert ent.shape == (B,)
+
+    def test_kl_gradient_flows(self):
+        """KL must produce non-zero gradients w.r.t. both arguments.
+
+        This directly validates the double-stop-gradient fix:
+        the RSSM calls dist(sg(post)).kl(dist(prior)) and
+        dist(post).kl(dist(sg(prior))), so kl() itself must NOT
+        add any internal stop-gradients.
+        """
+        logits_p = _make_logits(seed=0)
+        logits_q = _make_logits(seed=1)
+
+        def kl_wrt_p(lp):
+            dp = VQVAEDist(lp, STOCH, CLASSES, unimix=0.01)
+            dq = VQVAEDist(logits_q, STOCH, CLASSES, unimix=0.01)
+            return dp.kl(dq).sum()
+
+        def kl_wrt_q(lq):
+            dp = VQVAEDist(logits_p, STOCH, CLASSES, unimix=0.01)
+            dq = VQVAEDist(lq, STOCH, CLASSES, unimix=0.01)
+            return dp.kl(dq).sum()
+
+        grad_p = jax.grad(kl_wrt_p)(logits_p)
+        grad_q = jax.grad(kl_wrt_q)(logits_q)
+
+        assert jnp.abs(grad_p).sum() > 1e-6, \
+            'KL gradient w.r.t. first argument should be non-zero'
+        assert jnp.abs(grad_q).sum() > 1e-6, \
+            'KL gradient w.r.t. second argument should be non-zero'
+
+
+class TestVQVAELatentVsOneHot:
+    """Verify VQVAELatent has compatible interface with OneHotLatent."""
+
+    def test_same_shape(self):
+        oh = OneHotLatent(STOCH, CLASSES)
+        vq = VQVAELatent(STOCH, CLASSES)
+        assert oh.get_shape() == vq.get_shape()
+
+    def test_sample_shape_matches(self):
+        logits = _make_logits()
+        oh = OneHotLatent(STOCH, CLASSES, unimix=0.01)
+        vq = VQVAELatent(STOCH, CLASSES, unimix=0.01)
+        s_oh = oh.create_dist(logits).sample(jax.random.PRNGKey(0))
+        s_vq = vq.create_dist(logits).sample(jax.random.PRNGKey(0))
+        assert s_oh.shape == s_vq.shape
