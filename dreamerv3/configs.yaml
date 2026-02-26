@@ -241,7 +241,7 @@ defaults:
       actent: 3e-4       # Action entropy coefficient
       slowreg: 1.0
       pmpo_alpha: 0.5    # PMPO: balance between D+ and D- sets (only used when imag_loss_type=pmpo)
-      pmpo_beta: 0.3     # PMPO: reverse KL to BC prior strength (only used when imag_loss_type=pmpo)
+      pmpo_beta: 0.03     # PMPO: reverse KL to BC prior strength (only used when imag_loss_type=pmpo)
 
     repl_loss:
       slowtar: False
@@ -380,10 +380,14 @@ vqvae_latent:
     dyn:
       rssm: {latent: vqvae}
 
+# PMPO -- should require less normalization. Likely less efficient when rewards are dense, more efficient when rewards are sparese.
+# Note the pmpo alpha and beta that are set above.
 pmpo:
   agent:
     imag_loss_type: pmpo
     loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, bc_loss: 1.0}
+    imag_loss:
+      actent: 1e-2       # PMPO needs higher entropy than REINFORCE (sign-based loss has different gradient scale)
     # PMPO is scale-invariant, so disable return/advantage normalization
     retnorm: {impl: none, rate: 0.01, limit: 1e-8}
     advnorm: {impl: none, rate: 0.01, limit: 1e-8}
