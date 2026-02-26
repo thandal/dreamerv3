@@ -23,6 +23,30 @@ concat = lambda xs, a: jax.tree.map(lambda *x: jnp.concatenate(x, a), *xs)
 isimage = lambda s: s.dtype == np.uint8 and len(s.shape) == 3
 
 
+def _freeze_dist(dist):
+  """Reconstruct a distribution with stop-gradiented parameters.
+
+  This preserves the type hierarchy (Agg/Normal/Categorical/OneHot) required
+  by kl() methods, while ensuring no gradients flow through this distribution.
+  """
+  from embodied.jax import outs
+  if isinstance(dist, outs.Agg):
+    return outs.Agg(_freeze_dist(dist.output), len(dist.axes), dist.agg)
+  elif isinstance(dist, outs.Normal):
+    frozen = outs.Normal(sg(dist.mean), sg(dist.stddev))
+    # Preserve minent/maxent if present (set by bounded_normal)
+    for attr in ('minent', 'maxent'):
+      if hasattr(dist, attr):
+        setattr(frozen, attr, getattr(dist, attr))
+    return frozen
+  elif isinstance(dist, outs.OneHot):
+    return outs.OneHot(sg(dist.dist.logits))
+  elif isinstance(dist, outs.Categorical):
+    return outs.Categorical(sg(dist.logits))
+  else:
+    raise TypeError(f'Cannot freeze distribution of type {type(dist)}')
+
+
 class WorldModel(nj.Module):
   """World model: encoder, dynamics (RSSM), decoder, reward, continuation."""
 
@@ -157,6 +181,15 @@ class Agent(embodied.jax.Agent):
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
+
+    # Sanity check: if pmpo_beta > 0, bc_loss must also be enabled,
+    # otherwise the KL term regularizes toward an untrained BC policy.
+    if getattr(config, 'imag_loss_type', 'reinforce') == 'pmpo':
+      beta = config.imag_loss.get('pmpo_beta', 0.3)
+      bc_scale = config.loss_scales.get('bc_loss', 0.0)
+      assert beta == 0 or bc_scale > 0, (
+          f'pmpo_beta={beta} but bc_loss scale={bc_scale}. '
+          f'Set pmpo_beta=0 or enable bc_loss to train the BC prior.')
 
   @property
   def policy_keys(self):
@@ -310,7 +343,11 @@ class Agent(embodied.jax.Agent):
     # Build extra kwargs for PMPO (bc_policy)
     imag_extra = {}
     if imag_loss_fn is imag_loss_pmpo and self.bc_pol is not None:
-      imag_extra['bc_policy'] = self.bc_pol(sg(inp), 2)
+      # Stop-gradient bc_policy: the KL term KL(π_θ ‖ π_BC) should only push
+      # π_θ toward π_BC, not corrupt π_BC by pulling it toward π_θ.
+      # π_BC is trained separately via the supervised bc_loss.
+      bc_dists = self.bc_pol(sg(inp), 2)
+      imag_extra['bc_policy'] = {k: _freeze_dist(v) for k, v in bc_dists.items()}
     los, imgloss_out, mets = imag_loss_fn(
         imgact,
         self.rew(inp, 2).pred(),
