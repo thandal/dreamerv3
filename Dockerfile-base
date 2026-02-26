@@ -2,17 +2,7 @@
 #  docker build -f Dockerfile-base -t than6785/dreamer-base .
 #  docker push than6785/dreamer-base 
 
-# Can make patches live by using
-#  docker run -it than6785/dreamer-base bash
-# making the edits, and then while the container is still running
-#  docker commit CONTAINER_ID than6785/dreamer-base:patched
-
-# TODO: remove this once the patches are upstream.
-# Patch 1: ninjax (comment out noisy print)
-# Patch 2: /venv/lib/python3.11/site-packages/elements/logger.py (wandb video of single channel images)
-
 FROM ubuntu:24.04
-#FROM vastai/ubuntu-ssh
 
 # System
 ENV DEBIAN_FRONTEND=noninteractive
