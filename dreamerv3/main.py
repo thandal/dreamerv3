@@ -52,6 +52,19 @@ def main(argv=None):
       ipv6=config.ipv6,
   )
 
+  # Build worker→task_name mapping for per-task logging
+  tasks = _get_tasks(config)
+  if tasks:
+    num_envs = config.run.envs
+    strategy = config.multitask.strategy
+    assignments = embodied.multitask.assign_tasks(
+        tasks, num_envs, strategy, seed=config.seed)
+    # Map worker index → short task name (e.g. 'pong' from 'atari_pong')
+    task_assignments = {
+        i: name.split('_', 1)[1] for i, (name, _) in enumerate(assignments)}
+  else:
+    task_assignments = {}
+
   args = elements.Config(
       **config.run,
       replica=config.replica,
@@ -72,7 +85,7 @@ def main(argv=None):
         bind(_make_env_fn, config),
         bind(make_stream, config),
         bind(make_logger, config),
-        args)
+        args, task_assignments=task_assignments)
 
   elif config.script == 'train_eval':
     embodied.run.train_eval(
