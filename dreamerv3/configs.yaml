@@ -45,7 +45,7 @@ defaults:
     task_id: false         # Add task_id observation (false = agent discovers task itself)
 
   replay:
-    size: 1e6 # 5e6 -- corresponds to ~100 Gb RAM.
+    size: 1e6 # 5e6 corresponds to ~100 Gb RAM.
     online: True
     # Prioritized replay (Schaul et al., 2016). Use fracs.priority to control
     # prioritization strength (e.g. 0.5 = half prioritized, half uniform).
