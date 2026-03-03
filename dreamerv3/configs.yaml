@@ -36,6 +36,14 @@ defaults:
     dmc: {size: [64, 64], repeat: 1, proprio: True, image: True, camera: -1}
     loconav: {size: [64, 64], repeat: 1, camera: -1}
 
+  # Multi-task configuration
+  multitask:
+    tasks: ['none']        # List of tasks, e.g. [atari_pong, atari_breakout]
+                           # ['none'] = single-task mode (uses 'task' field)
+    strategy: round_robin  # round_robin | random
+    max_action_space: 18   # Padded discrete action space size (18 for Atari)
+    task_id: false         # Add task_id observation (false = agent discovers task itself)
+
   replay:
     size: 1e6 # 5e6 -- corresponds to ~100 Gb RAM.
     online: True
@@ -308,6 +316,14 @@ dmlab:
 atari:
   task: atari_pong
   run: {steps: 5.1e7, train_ratio: 32}
+
+atari_multitask:
+  multitask:
+    tasks: [atari_pong, atari_breakout, atari_seaquest]
+    strategy: round_robin
+    max_action_space: 18
+    task_id: false
+  run: {steps: 1e7, train_ratio: 32}
 
 procgen:
   task: procgen_coinrun

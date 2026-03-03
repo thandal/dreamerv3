@@ -69,7 +69,7 @@ def main(argv=None):
     embodied.run.train(
         bind(make_agent, config),
         bind(make_replay, config, 'replay'),
-        bind(make_env, config),
+        bind(_make_env_fn, config),
         bind(make_stream, config),
         bind(make_logger, config),
         args)
@@ -79,8 +79,8 @@ def main(argv=None):
         bind(make_agent, config),
         bind(make_replay, config, 'replay'),
         bind(make_replay, config, 'eval_replay', 'eval'),
-        bind(make_env, config),
-        bind(make_env, config),
+        bind(_make_env_fn, config),
+        bind(_make_env_fn, config),
         bind(make_stream, config),
         bind(make_logger, config),
         args)
@@ -88,7 +88,7 @@ def main(argv=None):
   elif config.script == 'eval_only':
     embodied.run.eval_only(
         bind(make_agent, config),
-        bind(make_env, config),
+        bind(_make_env_fn, config),
         bind(make_logger, config),
         args)
 
@@ -97,8 +97,8 @@ def main(argv=None):
         bind(make_agent, config),
         bind(make_replay, config, 'replay'),
         bind(make_replay, config, 'replay_eval', 'eval'),
-        bind(make_env, config),
-        bind(make_env, config),
+        bind(_make_env_fn, config),
+        bind(_make_env_fn, config),
         bind(make_stream, config),
         bind(make_logger, config),
         args)
@@ -106,12 +106,12 @@ def main(argv=None):
   elif config.script == 'parallel_env':
     is_eval = config.replica >= args.envs
     embodied.run.parallel.parallel_env(
-        bind(make_env, config), config.replica, args, is_eval)
+        bind(_make_env_fn, config), config.replica, args, is_eval)
 
   elif config.script == 'parallel_envs':
     is_eval = config.replica >= args.envs
     embodied.run.parallel.parallel_envs(
-        bind(make_env, config), bind(make_env, config), args)
+        bind(_make_env_fn, config), bind(_make_env_fn, config), args)
 
   elif config.script == 'parallel_replay':
     embodied.run.parallel.parallel_replay(
@@ -124,9 +124,36 @@ def main(argv=None):
     raise NotImplementedError(config.script)
 
 
+def _get_tasks(config):
+  """Return list of active tasks, filtering out sentinel values."""
+  return [t for t in config.multitask.tasks if t != 'none']
+
+
+def _make_env_fn(config, index, **overrides):
+  """Create an env, applying multi-task wrappers when multi-task is active."""
+  tasks = _get_tasks(config)
+  if tasks:
+    strategy = config.multitask.strategy
+    assignments = embodied.multitask.assign_tasks(
+        tasks, max(index + 1, 1), strategy, seed=config.seed)
+    task_name, task_idx = assignments[index % len(assignments)]
+    max_actions = int(config.multitask.max_action_space)
+    use_task_id = config.multitask.task_id
+    print(f'Multi-task env {index}: task={task_name} (id={task_idx})')
+    return make_env(
+        config, index,
+        task_override=task_name,
+        task_id=task_idx if use_task_id else None,
+        num_tasks=len(tasks) if use_task_id else None,
+        max_actions=max_actions,
+        **overrides)
+  else:
+    return make_env(config, index, **overrides)
+
+
 def make_agent(config):
   from .agent import Agent
-  env = make_env(config, 0)
+  env = _make_env_fn(config, 0)
   notlog = lambda k: not k.startswith('log/')
   obs_space = {k: v for k, v in env.obs_space.items() if notlog(k)}
   act_space = {k: v for k, v in env.act_space.items() if k != 'reset'}
@@ -152,7 +179,12 @@ def make_agent(config):
 def make_logger(config):
   step = elements.Counter()
   logdir = config.logdir
-  multiplier = config.env.get(config.task.split('_')[0], {}).get('repeat', 1)
+  tasks = _get_tasks(config)
+  if tasks:
+    suite = tasks[0].split('_')[0]
+  else:
+    suite = config.task.split('_')[0]
+  multiplier = config.env.get(suite, {}).get('repeat', 1)
   outputs = []
   outputs.append(elements.logger.TerminalOutput(config.logger.filter, 'Agent'))
   for output in config.logger.outputs:
@@ -211,8 +243,10 @@ def make_replay(config, folder, mode='train'):
   return embodied.replay.Replay(**kwargs)
 
 
-def make_env(config, index, **overrides):
-  suite, task = config.task.split('_', 1)
+def make_env(config, index, task_override=None, task_id=None, num_tasks=None,
+             max_actions=None, **overrides):
+  task = task_override or config.task
+  suite, task_name = task.split('_', 1)
   if suite == 'memmaze':
     from embodied.envs import from_gym
     import memory_maze  # noqa
@@ -244,8 +278,17 @@ def make_env(config, index, **overrides):
     kwargs['seed'] = hash((config.seed, index)) % (2 ** 32 - 1)
   if kwargs.pop('use_logdir', False):
     kwargs['logdir'] = elements.Path(config.logdir) / f'env{index}'
-  env = ctor(task, **kwargs)
-  return wrap_env(env, config)
+  env = ctor(task_name, **kwargs)
+  env = wrap_env(env, config)
+  # Multi-task wrappers
+  if max_actions is not None:
+    # Find the discrete action key
+    for key, space in env.act_space.items():
+      if key != 'reset' and space.discrete:
+        env = embodied.multitask.UnifyActions(env, key=key, max_actions=max_actions)
+  if task_id is not None and num_tasks is not None:
+    env = embodied.multitask.AddTaskID(env, task_id=task_id, num_tasks=num_tasks)
+  return env
 
 
 def wrap_env(env, config):
