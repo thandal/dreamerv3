@@ -1,6 +1,7 @@
-# docker build -f Dockerfile -t than6785/zd:dreamer1 .
+# docker build -f Dockerfile -t than6785/dreamer .
+# docker push than6785/dreamer
 
-# docker run -it --gpus all --rm -v ~/logdir/docker:/logdir than6785/zd:dreamer1 python dreamerv3/main.py --logdir /logdir/{timestamp} --configs dmc_vision size1m 
+# docker run -it --gpus all --rm -v ~/logdir/docker:/logdir than6785/dreamer python dreamerv3/main.py --logdir /logdir/{timestamp} --configs dmc_vision size1m 
 
 FROM than6785/dreamer-base
 
