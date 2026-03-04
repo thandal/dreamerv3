@@ -151,6 +151,7 @@ def _make_env_fn(config, index, **overrides):
         tasks, max(index + 1, 1), strategy, seed=config.seed)
     task_name, task_idx = assignments[index % len(assignments)]
     max_actions = int(config.multitask.max_action_space)
+    max_action_dim = int(config.multitask.max_action_dim)
     use_task_id = config.multitask.task_id
     print(f'Multi-task env {index}: task={task_name} (id={task_idx})')
     return make_env(
@@ -159,6 +160,7 @@ def _make_env_fn(config, index, **overrides):
         task_id=task_idx if use_task_id else None,
         num_tasks=len(tasks) if use_task_id else None,
         max_actions=max_actions,
+        max_action_dim=max_action_dim,
         **overrides)
   else:
     return make_env(config, index, **overrides)
@@ -257,7 +259,7 @@ def make_replay(config, folder, mode='train'):
 
 
 def make_env(config, index, task_override=None, task_id=None, num_tasks=None,
-             max_actions=None, **overrides):
+             max_actions=None, max_action_dim=None, **overrides):
   task = task_override or config.task
   suite, task_name = task.split('_', 1)
   if suite == 'memmaze':
@@ -293,12 +295,16 @@ def make_env(config, index, task_override=None, task_id=None, num_tasks=None,
     kwargs['logdir'] = elements.Path(config.logdir) / f'env{index}'
   env = ctor(task_name, **kwargs)
   env = wrap_env(env, config)
-  # Multi-task wrappers
-  if max_actions is not None:
-    # Find the discrete action key
+  # Multi-task wrappers — discrete action unification
+  if max_actions is not None and max_actions > 0:
     for key, space in env.act_space.items():
       if key != 'reset' and space.discrete:
         env = embodied.multitask.UnifyActions(env, key=key, max_actions=max_actions)
+  # Multi-task wrappers — continuous action unification
+  if max_action_dim is not None and max_action_dim > 0:
+    for key, space in env.act_space.items():
+      if key != 'reset' and not space.discrete:
+        env = embodied.multitask.UnifyContinuousActions(env, key=key, max_dim=max_action_dim)
   if task_id is not None and num_tasks is not None:
     env = embodied.multitask.AddTaskID(env, task_id=task_id, num_tasks=num_tasks)
   return env

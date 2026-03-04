@@ -184,3 +184,143 @@ class TestCombinedWrappers:
     for env in envs[1:]:
       assert env.act_space == envs[0].act_space
       assert env.obs_space.keys() == envs[0].obs_space.keys()
+
+
+class DummyContEnv(embodied.Env):
+  """Minimal continuous-action env for testing wrappers."""
+
+  def __init__(self, action_dim=3, image_size=(8, 8)):
+    self._action_dim = action_dim
+    self._image_size = image_size
+    self._done = True
+
+  @property
+  def obs_space(self):
+    return {
+        'image': elements.Space(np.uint8, (*self._image_size, 3)),
+        'reward': elements.Space(np.float32),
+        'is_first': elements.Space(bool),
+        'is_last': elements.Space(bool),
+        'is_terminal': elements.Space(bool),
+    }
+
+  @property
+  def act_space(self):
+    return {
+        'action': elements.Space(
+            np.float32, (self._action_dim,),
+            -np.ones(self._action_dim), np.ones(self._action_dim)),
+        'reset': elements.Space(bool),
+    }
+
+  def step(self, action):
+    if action['reset'] or self._done:
+      self._done = False
+      return self._obs(0.0, is_first=True)
+    # Record received action for testing
+    self._last_action = action['action'].copy()
+    self._done = True
+    return self._obs(1.0, is_last=True, is_terminal=True)
+
+  def _obs(self, reward, is_first=False, is_last=False, is_terminal=False):
+    return dict(
+        image=np.zeros((*self._image_size, 3), np.uint8),
+        reward=np.float32(reward),
+        is_first=is_first,
+        is_last=is_last,
+        is_terminal=is_terminal,
+    )
+
+
+class TestUnifyContinuousActions:
+
+  def test_pads_action_space(self):
+    env = DummyContEnv(action_dim=3)
+    wrapped = embodied.multitask.UnifyContinuousActions(
+        env, key='action', max_dim=6)
+    assert wrapped.act_space['action'].shape == (6,)
+    assert np.all(wrapped.act_space['action'].low == -1)
+    assert np.all(wrapped.act_space['action'].high == 1)
+
+  def test_valid_action_passes_through(self):
+    env = DummyContEnv(action_dim=3)
+    wrapped = embodied.multitask.UnifyContinuousActions(
+        env, key='action', max_dim=6)
+    action = np.zeros(6, dtype=np.float32)
+    action[:3] = [0.1, -0.5, 0.9]
+    obs = wrapped.step({'action': action, 'reset': True})
+    assert obs['is_first']
+
+  def test_extra_dims_ignored(self):
+    env = DummyContEnv(action_dim=3)
+    wrapped = embodied.multitask.UnifyContinuousActions(
+        env, key='action', max_dim=6)
+    # Reset first
+    wrapped.step({'action': np.zeros(6, np.float32), 'reset': True})
+    # Send action with padding in dims 3-5
+    action = np.array([0.1, -0.5, 0.9, 99.0, 99.0, 99.0], dtype=np.float32)
+    wrapped.step({'action': action, 'reset': False})
+    # The underlying env should only see the first 3 dims
+    np.testing.assert_array_almost_equal(
+        env._last_action, [0.1, -0.5, 0.9])
+
+  def test_exact_dim_no_padding(self):
+    env = DummyContEnv(action_dim=6)
+    wrapped = embodied.multitask.UnifyContinuousActions(
+        env, key='action', max_dim=6)
+    assert wrapped.act_space['action'].shape == (6,)
+    wrapped.step({'action': np.zeros(6, np.float32), 'reset': True})
+    action = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], dtype=np.float32)
+    wrapped.step({'action': action, 'reset': False})
+    np.testing.assert_array_almost_equal(env._last_action, action)
+
+  def test_preserves_obs_space(self):
+    env = DummyContEnv(action_dim=3)
+    wrapped = embodied.multitask.UnifyContinuousActions(
+        env, key='action', max_dim=6)
+    assert wrapped.obs_space == env.obs_space
+
+  def test_error_if_max_too_small(self):
+    env = DummyContEnv(action_dim=6)
+    with pytest.raises(AssertionError):
+      embodied.multitask.UnifyContinuousActions(
+          env, key='action', max_dim=3)
+
+  def test_error_on_discrete_space(self):
+    env = DummyDiscEnv(num_actions=5)
+    with pytest.raises(AssertionError):
+      embodied.multitask.UnifyContinuousActions(
+          env, key='action', max_dim=18)
+
+
+class TestContinuousCombinedWrappers:
+
+  def test_continuous_unify_then_task_id(self):
+    """Test that both continuous wrappers compose correctly."""
+    env = DummyContEnv(action_dim=3)
+    env = embodied.multitask.UnifyContinuousActions(
+        env, key='action', max_dim=6)
+    env = embodied.multitask.AddTaskID(env, task_id=1, num_tasks=3)
+
+    assert env.act_space['action'].shape == (6,)
+    assert 'task_id' in env.obs_space
+
+    obs = env.step({'action': np.zeros(6, np.float32), 'reset': True})
+    assert obs['task_id'] == 1
+    assert obs['is_first']
+
+  def test_different_dims_same_space(self):
+    """Multiple envs with different action dims get unified."""
+    envs = []
+    for i, dim in enumerate([1, 4, 6]):
+      env = DummyContEnv(action_dim=dim)
+      env = embodied.multitask.UnifyContinuousActions(
+          env, key='action', max_dim=6)
+      env = embodied.multitask.AddTaskID(env, task_id=i, num_tasks=3)
+      envs.append(env)
+
+    # All should have same action space shape
+    for env in envs[1:]:
+      assert env.act_space['action'].shape == envs[0].act_space['action'].shape
+      assert env.obs_space.keys() == envs[0].obs_space.keys()
+
