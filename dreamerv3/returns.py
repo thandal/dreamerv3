@@ -12,6 +12,7 @@ Available strategies:
 """
 
 import chex
+import jax
 import jax.numpy as jnp
 
 f32 = jnp.float32
@@ -139,28 +140,36 @@ class NStepReturn(ReturnComputer):
         chex.assert_equal_shape((last, term, rew, val, boot))
 
         B, T = rew.shape
-        rets = []
 
-        # For each timestep, sum n future rewards
-        for t in range(T - 1):
-            ret = jnp.zeros(B, dtype=f32)
-            discount = 1.0
+        def calc_for_t(t):
+            def step(carry, k):
+                ret, discount = carry
+                idx = t + k + 1
+                valid = idx < T
 
-            for k in range(min(n, T - t - 1)):
+                safe_idx = jnp.minimum(idx, T - 1)
+
                 # Add discounted reward
-                ret = ret + discount * rew[:, t + k + 1]
+                r = jnp.where(valid, rew[:, safe_idx], 0.0)
+                ret = ret + discount * r
 
                 # Stop at episode boundaries or terminals
-                live = (1 - f32(term[:, t + k + 1])) * (1 - f32(last[:, t + k + 1]))
-                discount = discount * disc * live
+                l = jnp.where(valid, (1 - f32(term[:, safe_idx])) * (1 - f32(last[:, safe_idx])), 0.0)
+                next_discount = jnp.where(valid, discount * disc * l, discount)
+
+                return (ret, next_discount), None
+
+            init_carry = (jnp.zeros(B, dtype=f32), jnp.ones(B, dtype=f32))
+            (ret, discount), _ = jax.lax.scan(step, init_carry, jnp.arange(n))
 
             # Add bootstrapped value at n-th step (or end of sequence)
-            final_idx = min(t + n, T - 1)
+            final_idx = jnp.minimum(t + n, T - 1)
             ret = ret + discount * boot[:, final_idx]
+            return ret
 
-            rets.append(ret)
-
-        return jnp.stack(rets, 1)
+        ts = jnp.arange(T - 1)
+        rets = jax.vmap(calc_for_t)(ts)
+        return jnp.transpose(rets, (1, 0))
 
 
 class MonteCarloReturn(ReturnComputer):
