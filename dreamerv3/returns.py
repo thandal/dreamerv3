@@ -265,7 +265,7 @@ class GAE(ReturnComputer):
         chex.assert_equal_shape((last, term, rew, val, boot))
 
         # Compute TD errors: δ_t = r_t + γV_{t+1} - V_t
-        next_val = jnp.concatenate([val[:, 1:], boot[:, -1:]], axis=1)
+        next_val = jnp.concatenate([val[:, 1:-1], boot[:, -1:]], axis=1)
         live = (1 - f32(term))[:, 1:] * disc
         td_errors = rew[:, 1:] + live * next_val - val[:, :-1]
 
