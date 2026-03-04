@@ -12,6 +12,7 @@ Available strategies:
 """
 
 import chex
+import jax
 import jax.numpy as jnp
 
 f32 = jnp.float32
@@ -193,24 +194,23 @@ class MonteCarloReturn(ReturnComputer):
         """
         chex.assert_equal_shape((last, term, rew, val, boot))
 
-        B, T = rew.shape
-        rets = []
+        # Monte Carlo returns use all rewards until episode end
+        # R_t = r_{t+1} + γ * live_{t+1} * R_{t+1}
+        # We can compute this efficiently using a backward scan.
 
-        # Start from the end and work backwards
-        for t in range(T - 1):
-            ret = jnp.zeros(B, dtype=f32)
-            discount = 1.0
+        # Shape (B, T-1)
+        rew = rew[:, 1:]
+        live = (1 - f32(term[:, 1:])) * (1 - f32(last[:, 1:]))
 
-            for k in range(t + 1, T):
-                ret = ret + discount * rew[:, k]
+        def body(ret, inputs):
+            rew, live = inputs
+            ret = rew + disc * live * ret
+            return ret, ret
 
-                # Stop at episode boundaries or terminals
-                live = (1 - f32(term[:, k])) * (1 - f32(last[:, k]))
-                discount = discount * disc * live
+        _, returns = jax.lax.scan(
+            body, jnp.zeros_like(rew[:, 0]), (rew.T, live.T), reverse=True)
 
-            rets.append(ret)
-
-        return jnp.stack(rets, 1)
+        return returns.T
 
 
 class GAE(ReturnComputer):
