@@ -108,7 +108,8 @@ class TestDriver:
     driver(agent.policy, episodes=1)
     assert len(steps) == 8
     steps = {k: np.array([x[k] for x in steps]) for k in steps[0]}
-    assert (steps['reset'] == [0, 0, 0, 0, 0, 0, 0, 1]).all()
+    # Reset is explicitly *not* included as an action.
+    #assert (steps['reset'] == [0, 0, 0, 0, 0, 0, 0, 1]).all()
     assert (steps['is_first'] == [1, 0, 0, 1, 0, 0, 0, 0]).all()
     assert (steps['is_last'] == [0, 0, 0, 0, 0, 0, 0, 1]).all()
 
