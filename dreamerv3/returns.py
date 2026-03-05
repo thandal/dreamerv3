@@ -207,8 +207,8 @@ class MonteCarloReturn(ReturnComputer):
             last: Episode boundaries (B, T)
             term: Terminal states (B, T)
             rew: Rewards (B, T)
-            val: Value predictions (ignored)
-            boot: Bootstrap values (ignored)
+            val: Value predictions (ignored, for compatibility)
+            boot: Bootstrap values (ignored, for compatibility)
             disc: Discount factor
 
         Returns:
@@ -243,13 +243,16 @@ class GAE(ReturnComputer):
 
     Returns are then: ret_t = A_t + V_t
 
-    This is the standard method used in PPO and other algorithms.
+    This is the standard method used in PPO and other policy gradient
+    algorithms.
 
     Reference:
-        Schulman et al. (2016)
+        Schulman et al. (2016) - "High-Dimensional Continuous Control
+        Using GAE"
 
     Args:
         lam: GAE lambda parameter (default: 0.95)
+             Controls bias-variance tradeoff like TD(λ)
     """
 
     def __init__(self, lam=0.95, **kwargs):
@@ -310,11 +313,16 @@ def create_return_computer(strategy: str, **kwargs):
     """Factory function to create a return computer.
 
     Args:
-        strategy: Return computation strategy
+        strategy: Return computation strategy ('lambda', 'nstep',
+                  'montecarlo', 'gae')
         **kwargs: Strategy-specific parameters
 
     Returns:
         ReturnComputer instance
+
+    Example:
+        >>> comp = create_return_computer('lambda', lam=0.95)
+        >>> returns = comp.compute(last, term, rew, val, boot, disc)
     """
     if strategy not in RETURN_COMPUTERS:
         avails = list(RETURN_COMPUTERS.keys())
