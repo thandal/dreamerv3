@@ -15,7 +15,8 @@ class Replay:
 
   def __init__(
       self, length, capacity=None, directory=None, chunksize=1024,
-      online=False, selector=None, save_wait=False, name='unnamed', seed=0):
+      online=False, selector=None, save_wait=False, name='unnamed', seed=0,
+      evict_files=True):
 
     self.length = length
     self.capacity = capacity
@@ -49,6 +50,7 @@ class Replay:
     else:
       self.directory = None
     self.save_wait = save_wait
+    self.evict_files = evict_files
 
     self.metrics = {'samples': 0, 'inserts': 0, 'updates': 0}
 
@@ -202,8 +204,18 @@ class Replay:
       if self.refs[chunkid] < 1:
         del self.refs[chunkid]
         chunk = self.chunks.pop(chunkid)
+        if self.evict_files and self.directory and chunk.uuid in self.saved:
+          self.saved.discard(chunk.uuid)
+          self.workers.submit(self._delete_chunk_file, chunk)
         if chunk.succ in self.refs:
           self.refs[chunk.succ] -= 1
+
+  def _delete_chunk_file(self, chunk):
+    path = self.directory / chunk.filename
+    try:
+      path.remove()
+    except Exception:
+      pass
 
   def _getseq(self, chunkid, index, keys=None, concat=True):
     chunk = self.chunks[chunkid]

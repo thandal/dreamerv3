@@ -36,8 +36,17 @@ defaults:
     dmc: {size: [64, 64], repeat: 1, proprio: True, image: True, camera: -1}
     loconav: {size: [64, 64], repeat: 1, camera: -1}
 
+  # Multi-task configuration
+  multitask:
+    tasks: ['none']        # List of tasks, e.g. [atari_pong, atari_breakout]
+                           # ['none'] = single-task mode (uses 'task' field)
+    strategy: round_robin  # round_robin | random
+    max_action_space: 18   # Padded discrete action space size (18 for Atari)
+    max_action_dim: 0      # Padded continuous action dim (0 = disabled)
+    task_id: false         # Add task_id observation (false = agent discovers task itself)
+
   replay:
-    size: 1e6 # 5e6 -- corresponds to ~100 Gb RAM.
+    size: 1e6 # 5e6 corresponds to ~100 Gb RAM.
     online: True
     # Prioritized replay (Schaul et al., 2016). Use fracs.priority to control
     # prioritization strength (e.g. 0.5 = half prioritized, half uniform).
@@ -46,6 +55,7 @@ defaults:
     priosignal: model
     recexp: 1.0
     chunksize: 1024
+    evict_files: True
 
   run:
     steps: 1e10
@@ -309,6 +319,14 @@ atari:
   task: atari_pong
   run: {steps: 5.1e7, train_ratio: 32}
 
+atari_multitask:
+  multitask:
+    tasks: [atari_pong, atari_breakout, atari_seaquest]
+    strategy: round_robin
+    max_action_space: 18
+    task_id: false
+  run: {steps: 1e7, train_ratio: 32}
+
 procgen:
   task: procgen_coinrun
   run: {steps: 1.1e8, train_ratio: 64}
@@ -329,6 +347,16 @@ dmc_proprio:
 
 dmc_vision:
   task: dmc_walker_walk
+  env.dmc.proprio: False
+  run: {steps: 1.1e6, train_ratio: 256}
+
+dmc_vision_multitask:
+  multitask:
+    tasks: [dmc_walker_walk, dmc_cartpole_balance, dmc_cheetah_run]
+    strategy: round_robin
+    max_action_space: 0      # Not used (no discrete actions)
+    max_action_dim: 6        # Max continuous action dim across tasks
+    task_id: false
   env.dmc.proprio: False
   run: {steps: 1.1e6, train_ratio: 256}
 

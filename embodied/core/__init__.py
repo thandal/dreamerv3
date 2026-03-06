@@ -11,4 +11,5 @@ from . import clock
 from . import limiters
 from . import selectors
 from . import streams
+from . import multitask
 from . import wrappers

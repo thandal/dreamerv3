@@ -6,7 +6,9 @@ import embodied
 import numpy as np
 
 
-def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
+def train(
+    make_agent, make_replay, make_env, make_stream, make_logger, args,
+    task_assignments=None):
 
   agent = make_agent()
   replay = make_replay()
@@ -20,6 +22,10 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
   episodes = collections.defaultdict(elements.Agg)
   policy_fps = elements.FPS()
   train_fps = elements.FPS()
+
+  # Per-task episode aggregators
+  task_map = task_assignments or {}
+  task_epstats = collections.defaultdict(elements.Agg) if task_map else {}
 
   batch_steps = args.batch_size * args.batch_length
   should_train = elements.when.Ratio(args.train_ratio / batch_steps)
@@ -45,14 +51,27 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
         episode.add(key + '/sum', value, agg='sum')
     if tran['is_last']:
       result = episode.result()
+      score = result.pop('score')
+      length = result.pop('length')
       logger.add({
-          'score': result.pop('score'),
-          'length': result.pop('length'),
+          'score': score,
+          'length': length,
       }, prefix='episode')
       rew = result.pop('rewards')
+      reward_rate = None
       if len(rew) > 1:
-        result['reward_rate'] = (np.abs(rew[1:] - rew[:-1]) >= 0.01).mean()
+        reward_rate = (np.abs(rew[1:] - rew[:-1]) >= 0.01).mean()
+        result['reward_rate'] = reward_rate
       epstats.add(result)
+      # Per-task logging
+      if worker in task_map:
+        task_name = task_map[worker]
+        logger.add({'score': score, 'length': length},
+                   prefix=f'episode/{task_name}')
+        task_result = {}
+        if reward_rate is not None:
+          task_result['reward_rate'] = reward_rate
+        task_epstats[task_name].add(task_result)
 
   fns = [bind(make_env, i) for i in range(args.envs)]
   driver = embodied.Driver(fns, parallel=not args.debug)
@@ -106,6 +125,8 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
     if should_log(step):
       logger.add(train_agg.result())
       logger.add(epstats.result(), prefix='epstats')
+      for task_name, agg in task_epstats.items():
+        logger.add(agg.result(), prefix=f'epstats/{task_name}')
       logger.add(replay.stats(), prefix='replay')
       logger.add(usage.stats(), prefix='usage')
       logger.add({'fps/policy': policy_fps.result()})
