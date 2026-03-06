@@ -91,6 +91,7 @@ Scalar metrics are also writting as JSONL files.
 ## Vast.ai
 
 Put your WANDB_API_KEY into a Vast environment variable.
+Optionally also set WANDB_PROJECT, if desired.
 
 ```sh
 docker build -f Dockerfile-base -t than6785/dreamer-base .
