@@ -1,5 +1,11 @@
 set -e
 
+cleanup() {
+  echo "Cleaning up..."
+  vastai destroy instance "$CONTAINER_ID"
+}
+trap cleanup EXIT
+
 env
 
 # ldconfig
@@ -21,5 +27,3 @@ echo
 
 xvfb-run -a -s '-screen 0 1024x768x24 -ac +extension GLX +render -noreset' "$@"
 # xvfb-run "$@"
-
-vastai destroy instance $CONTAINER_ID
