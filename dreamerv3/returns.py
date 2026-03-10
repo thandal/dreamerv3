@@ -83,9 +83,6 @@ class LambdaReturn(ReturnComputer):
 
         chex.assert_equal_shape((last, term, rew, val, boot))
 
-        # Start from the last bootstrap value
-        rets = [boot[:, -1]]
-
         # Compute effective discount accounting for termination
         live = (1 - f32(term))[:, 1:] * disc
 
@@ -96,10 +93,22 @@ class LambdaReturn(ReturnComputer):
         interm = rew[:, 1:] + (1 - cont) * live * boot[:, 1:]
 
         # Backward pass to compute returns
-        for t in reversed(range(live.shape[1])):
-            rets.append(interm[:, t] + live[:, t] * cont[:, t] * rets[-1])
+        # Using jax.lax.scan to avoid O(T) node graph size during JIT compilation
+        def step(carry, inputs):
+            interm_t, live_t, cont_t = inputs
+            ret_t = interm_t + live_t * cont_t * carry
+            return ret_t, ret_t
 
-        return jnp.stack(list(reversed(rets))[:-1], 1)
+        carry = boot[:, -1]
+        # Transpose inputs to (T, B) for scan along time dimension
+        interm_T = jnp.swapaxes(interm, 0, 1)
+        live_T = jnp.swapaxes(live, 0, 1)
+        cont_T = jnp.swapaxes(cont, 0, 1)
+
+        _, rets_T = jax.lax.scan(step, carry, (interm_T, live_T, cont_T), reverse=True)
+
+        # Transpose back to (B, T)
+        return jnp.swapaxes(rets_T, 0, 1)
 
 
 class NStepReturn(ReturnComputer):
@@ -270,14 +279,23 @@ class GAE(ReturnComputer):
         td_errors = rew[:, 1:] + live * next_val - val[:, :-1]
 
         # Compute GAE advantages via backward pass
-        advs = []
-        gae = jnp.zeros(val.shape[0], dtype=f32)
+        # Using jax.lax.scan to avoid O(T) node graph size during JIT compilation
+        def step(carry, inputs):
+            td_t, live_t, last_t_plus_1 = inputs
+            gae_t = td_t + live_t * lam * carry * (1 - last_t_plus_1)
+            return gae_t, gae_t
 
-        for t in reversed(range(td_errors.shape[1])):
-            gae = td_errors[:, t] + live[:, t] * lam * gae * (1 - f32(last)[:, t + 1])
-            advs.append(gae)
+        carry = jnp.zeros(val.shape[0], dtype=f32)
 
-        advs = jnp.stack(list(reversed(advs)), 1)
+        # Transpose inputs to (T, B) for scan along time dimension
+        td_T = jnp.swapaxes(td_errors, 0, 1)
+        live_T = jnp.swapaxes(live, 0, 1)
+        last_t_plus_1_T = jnp.swapaxes(f32(last)[:, 1:], 0, 1)
+
+        _, advs_T = jax.lax.scan(step, carry, (td_T, live_T, last_t_plus_1_T), reverse=True)
+
+        # Transpose back to (B, T)
+        advs = jnp.swapaxes(advs_T, 0, 1)
 
         # Returns = advantages + values
         returns = advs + val[:, :-1]
