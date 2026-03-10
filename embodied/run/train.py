@@ -26,6 +26,7 @@ def train(
   # Per-task episode aggregators
   task_map = task_assignments or {}
   task_epstats = collections.defaultdict(elements.Agg) if task_map else {}
+  task_latest = {}  # most recent episode stats per task, for computing mean
 
   batch_steps = args.batch_size * args.batch_length
   should_train = elements.when.Ratio(args.train_ratio / batch_steps)
@@ -53,25 +54,29 @@ def train(
       result = episode.result()
       score = result.pop('score')
       length = result.pop('length')
-      logger.add({
-          'score': score,
-          'length': length,
-      }, prefix='episode')
       rew = result.pop('rewards')
       reward_rate = None
       if len(rew) > 1:
         reward_rate = (np.abs(rew[1:] - rew[:-1]) >= 0.01).mean()
         result['reward_rate'] = reward_rate
       epstats.add(result)
-      # Per-task logging
-      if worker in task_map:
-        task_name = task_map[worker]
-        logger.add({'score': score, 'length': length},
-                   prefix=f'episode/{task_name}')
-        task_result = {}
-        if reward_rate is not None:
-          task_result['reward_rate'] = reward_rate
-        task_epstats[task_name].add(task_result)
+      if not task_map:
+        logger.add({'score': score, 'length': length}, prefix='episode')
+      else:
+        # Per-task logging; update latest and log mean across tasks
+        if worker in task_map:
+          task_name = task_map[worker]
+          logger.add({'score': score, 'length': length},
+                     prefix=f'episode/{task_name}')
+          task_result = {}
+          if reward_rate is not None:
+            task_result['reward_rate'] = reward_rate
+          task_epstats[task_name].add(task_result)
+          task_latest[task_name] = {'score': score, 'length': length}
+        if task_latest:
+          mean_score = np.mean([v['score'] for v in task_latest.values()])
+          mean_length = np.mean([v['length'] for v in task_latest.values()])
+          logger.add({'score': mean_score, 'length': mean_length}, prefix='episode')
 
   fns = [bind(make_env, i) for i in range(args.envs)]
   driver = embodied.Driver(fns, parallel=not args.debug)
