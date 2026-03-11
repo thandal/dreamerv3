@@ -91,6 +91,112 @@ class Normalize(nj.Module):
     var.write((1 - self.rate) * var.read() + self.rate * sg(x))
 
 
+class PerTaskNormalize(nj.Module):
+  """Per-task return normalizer. Maintains separate EMA stats for each task.
+
+  Supports 'perc' and 'none' impls. On update, uses an inf-fill trick so that
+  non-task trajectories don't affect each task's percentile: for the low
+  percentile, non-task values are filled with +inf (they rank above task
+  values); for the high percentile, with -inf (they rank below). The
+  conditional update (only update task i if it has samples in the batch) is
+  handled via jnp.where so it is JIT-compatible.
+  """
+
+  rate: float = 0.01
+  limit: float = 1e-8
+  perclo: float = 5.0
+  perchi: float = 95.0
+  debias: bool = True
+
+  def __init__(self, num_tasks, impl):
+    self.num_tasks = num_tasks
+    self.impl = impl
+    if impl == 'perc':
+      self.lo = nj.Variable(jnp.zeros, (num_tasks,), f32, name='lo')
+      self.hi = nj.Variable(jnp.zeros, (num_tasks,), f32, name='hi')
+      if self.debias:
+        self.corr = nj.Variable(jnp.zeros, (num_tasks,), f32, name='corr')
+    elif impl == 'none':
+      pass
+    else:
+      raise NotImplementedError(
+          f'PerTaskNormalize only supports perc/none, got: {impl}')
+
+  def __call__(self, x, task_ids, update):
+    """Args:
+      x: (B, H) float array of returns for imagined trajectories.
+      task_ids: (B,) int array mapping each trajectory to its task index.
+      update: bool, whether to update running statistics.
+    Returns:
+      (offset, scale) each with shape (B, 1) for broadcasting over H.
+    """
+    if update:
+      self._update_stats(x, task_ids)
+    return self._get_stats(task_ids)
+
+  def _update_stats(self, x, task_ids):
+    x = sg(f32(x))
+    lo = self.lo.read()   # (N,)
+    hi = self.hi.read()   # (N,)
+    if self.debias:
+      corr = self.corr.read()  # (N,)
+    for i in range(self.num_tasks):
+      mask = (task_ids == i)  # (B,)
+      has_samples = mask.any()
+      # inf-fill: non-task values rank out of range, so they don't shift the
+      # low percentile up or the high percentile down.
+      x_for_lo = jnp.where(mask[:, None], x, jnp.inf)
+      x_for_hi = jnp.where(mask[:, None], x, -jnp.inf)
+      axes = internal.get_data_axes()
+      if axes:
+        x_for_lo = jax.lax.all_gather(x_for_lo, axes)
+        x_for_hi = jax.lax.all_gather(x_for_hi, axes)
+      new_lo_i = jnp.percentile(x_for_lo, self.perclo)
+      new_hi_i = jnp.percentile(x_for_hi, self.perchi)
+      # Only apply EMA update when task i actually has samples in this batch.
+      lo = lo.at[i].set(jnp.where(
+          has_samples,
+          (1 - self.rate) * lo[i] + self.rate * new_lo_i,
+          lo[i]))
+      hi = hi.at[i].set(jnp.where(
+          has_samples,
+          (1 - self.rate) * hi[i] + self.rate * new_hi_i,
+          hi[i]))
+      if self.debias:
+        corr = corr.at[i].set(jnp.where(
+            has_samples,
+            (1 - self.rate) * corr[i] + self.rate * 1.0,
+            corr[i]))
+    self.lo.write(lo)
+    self.hi.write(hi)
+    if self.debias:
+      self.corr.write(corr)
+
+  def _get_stats(self, task_ids):
+    if self.impl == 'none':
+      return 0.0, 1.0
+    lo = self.lo.read()  # (N,)
+    hi = self.hi.read()  # (N,)
+    if self.debias:
+      corr = jnp.maximum(self.rate, self.corr.read())
+      lo = lo / corr
+      hi = hi / corr
+    # Select per-trajectory stats and expand for broadcasting over H dim.
+    elem_lo = jnp.take(lo, task_ids, axis=0)[:, None]            # (B, 1)
+    elem_scale = jnp.maximum(
+        self.limit,
+        jnp.take(hi, task_ids, axis=0)[:, None] - elem_lo)       # (B, 1)
+    return sg(elem_lo), sg(elem_scale)
+
+  def stats(self):
+    """Return mean stats across tasks (for logging/compat)."""
+    if self.impl == 'none':
+      return 0.0, 1.0
+    lo = self.lo.read().mean()
+    hi = self.hi.read().mean()
+    return sg(lo), sg(jnp.maximum(self.limit, hi - lo))
+
+
 class SlowModel:
 
   def __init__(self, model, *, source, rate=1.0, every=1):

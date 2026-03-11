@@ -131,7 +131,13 @@ class ActorCritic(nj.Module):
         embodied.jax.MLPHead(scalar, **config.value, name='slowval'),
         source=self.val, **config.slowvalue)
 
-    self.retnorm = embodied.jax.Normalize(**config.retnorm, name='retnorm')
+    tasks = config.multitask.tasks
+    num_tasks = len(tasks) if tasks != ['none'] else 1
+    if num_tasks > 1:
+      self.retnorm = embodied.jax.PerTaskNormalize(
+          num_tasks, **config.retnorm, name='retnorm')
+    else:
+      self.retnorm = embodied.jax.Normalize(**config.retnorm, name='retnorm')
     self.valnorm = embodied.jax.Normalize(**config.valnorm, name='valnorm')
     self.advnorm = embodied.jax.Normalize(**config.advnorm, name='advnorm')
 
@@ -326,6 +332,11 @@ class Agent(embodied.jax.Agent):
     # Imagination
     K = min(self.config.imag_last or T, T)
     H = self.config.imag_length
+    # Per-task retnorm: extract task_id for each imagined starting point.
+    # task_id is constant within a sequence, so any timestep's value is fine.
+    raw_task_id = obs.get('task_id', None)
+    imag_task_id = (
+        raw_task_id[:, -K:].reshape(B * K) if raw_task_id is not None else None)
     starts = self.dyn.starts(dyn_entries, dyn_carry, K)
     policyfn = lambda feat: sample(self.pol(self.feat2tensor(feat), 1))
     _, imgfeat, imgprevact = self.dyn.imagine(starts, policyfn, H, training)
@@ -357,6 +368,7 @@ class Agent(embodied.jax.Agent):
         self.slowval(inp, 2),
         self.retnorm, self.valnorm, self.advnorm,
         update=training,
+        task_ids=imag_task_id,
         contdisc=self.config.contdisc,
         horizon=self.config.horizon,
         **self.config.imag_loss,
@@ -541,6 +553,7 @@ def imag_loss(
     policy, value, slowvalue,
     retnorm, valnorm, advnorm,
     update,
+    task_ids=None,
     contdisc=True,
     slowtar=True,
     horizon=333,
@@ -562,7 +575,10 @@ def imag_loss(
   term = 1 - con
   ret = lambda_return(last, term, rew, tarval, tarval, disc, lam)
 
-  roffset, rscale = retnorm(ret, update)
+  if task_ids is not None and hasattr(retnorm, 'num_tasks'):
+    roffset, rscale = retnorm(ret, task_ids, update)
+  else:
+    roffset, rscale = retnorm(ret, update)
   adv = (ret - tarval[:, :-1]) / rscale
   aoffset, ascale = advnorm(adv, update)
   adv_normed = (adv - aoffset) / ascale
@@ -609,6 +625,7 @@ def imag_loss_pmpo(
     policy, value, slowvalue,
     retnorm, valnorm, advnorm,
     update,
+    task_ids=None,
     contdisc=True,
     slowtar=True,
     horizon=333,
@@ -645,7 +662,10 @@ def imag_loss_pmpo(
   ret = lambda_return(last, term, rew, tarval, tarval, disc, lam)
 
   # Advantages (unnormalized — PMPO only uses sign)
-  roffset, rscale = retnorm(ret, update)
+  if task_ids is not None and hasattr(retnorm, 'num_tasks'):
+    roffset, rscale = retnorm(ret, task_ids, update)
+  else:
+    roffset, rscale = retnorm(ret, update)
   adv = ret - tarval[:, :-1]
 
   # Log-probs and entropy

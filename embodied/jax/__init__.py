@@ -6,6 +6,7 @@ from .heads import MLPHead
 
 from .utils import LayerScan
 from .utils import Normalize
+from .utils import PerTaskNormalize
 from .utils import SlowModel
 
 from .opt import Optimizer
