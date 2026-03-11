@@ -131,7 +131,7 @@ class ActorCritic(nj.Module):
         embodied.jax.MLPHead(scalar, **config.value, name='slowval'),
         source=self.val, **config.slowvalue)
 
-    tasks = config.multitask.tasks
+    tasks = getattr(getattr(config, 'multitask', None), 'tasks', ['none'])
     num_tasks = len(tasks) if tasks != ['none'] else 1
     if num_tasks > 1:
       self.retnorm = embodied.jax.PerTaskNormalize(
