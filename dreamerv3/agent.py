@@ -55,9 +55,13 @@ class WorldModel(nj.Module):
     self.act_space = act_space
     self.config = config
     
-    exclude = ('is_first', 'is_last', 'is_terminal', 'reward', 'task_id')
-    enc_space = {k: v for k, v in obs_space.items() if k not in exclude}
-    dec_space = {k: v for k, v in obs_space.items() if k not in exclude}
+    always_exclude = ('is_first', 'is_last', 'is_terminal', 'reward')
+    task_id_for_models = getattr(
+        getattr(config, 'multitask', None), 'task_id_for_models', False)
+    enc_exclude = set(always_exclude) | (set() if task_id_for_models else {'task_id'})
+    dec_exclude = set(always_exclude) | {'task_id'}  # never reconstruct task_id
+    enc_space = {k: v for k, v in obs_space.items() if k not in enc_exclude}
+    dec_space = {k: v for k, v in obs_space.items() if k not in dec_exclude}
 
     # Use encoder registry
     self.enc = encoders_module.create_encoder(

@@ -157,7 +157,8 @@ def _make_env_fn(config, index, **overrides):
     task_name, task_idx = assignments[index % len(assignments)]
     max_actions = int(config.multitask.max_action_space)
     max_action_dim = int(config.multitask.max_action_dim)
-    use_task_id = config.multitask.task_id
+    use_task_id = (config.multitask.task_id_for_normalization
+                   or config.multitask.task_id_for_models)
     print(f'Multi-task env {index}: task={task_name} (id={task_idx})')
     return make_env(
         config, index,
@@ -193,6 +194,7 @@ def make_agent(config):
       report_length=config.report_length,
       replica=config.replica,
       replicas=config.replicas,
+      multitask=config.multitask,
   ))
 
 
