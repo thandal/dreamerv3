@@ -20,7 +20,8 @@ def combined(
     make_env_eval,
     make_stream,
     make_logger,
-    args):
+    args,
+    task_assignments=None):
 
   if args.actor_batch <= 0:
     args = args.update(actor_batch=max(1, args.envs // 2))
@@ -42,7 +43,8 @@ def combined(
     workers.append(portal.Process(parallel_agent, make_agent, args))
   else:
     workers.append(portal.Thread(parallel_agent, make_agent, args))
-  workers.append(portal.Process(parallel_logger, make_logger, args))
+  workers.append(portal.Process(
+      parallel_logger, make_logger, args, task_assignments or {}))
 
   if not args.remote_envs:
     for i in range(args.envs):
@@ -321,7 +323,7 @@ def parallel_replay(make_replay_train, make_replay_eval, make_stream, args):
 
 
 @elements.timer.section('logger')
-def parallel_logger(make_logger, args):
+def parallel_logger(make_logger, args, task_assignments=None):
   if isinstance(make_logger, bytes):
     make_logger = cloudpickle.loads(make_logger)
 
@@ -340,6 +342,21 @@ def parallel_logger(make_logger, args):
   episodes = collections.defaultdict(elements.Agg)
   updated = collections.defaultdict(lambda: None)
   dones = collections.defaultdict(lambda: True)
+
+  # Per-task episode aggregators
+  task_map = task_assignments or {}
+  task_epstats = collections.defaultdict(elements.Agg) if task_map else {}
+
+  # Determine which envids capture images (one per task, or first_addr)
+  if task_map:
+    image_addrs = set()
+    seen_tasks = set()
+    for w in sorted(task_map):
+      if task_map[w] not in seen_tasks:
+        image_addrs.add(w)
+        seen_tasks.add(task_map[w])
+  else:
+    image_addrs = None
 
   @elements.timer.section('addfn')
   def addfn(metrics):
@@ -369,11 +386,15 @@ def parallel_logger(make_logger, args):
       episode.add('length', 1, agg='sum')
       episode.add('rewards', tran['reward'], agg='stack')
 
-      first_addr = next(iter(episodes.keys()))
       for key, value in tran.items():
         if value.dtype == np.uint8 and value.ndim == 3:
-          if addr == first_addr:
-            episode.add(f'policy_{key}', value, agg='stack')
+          if image_addrs is not None:
+            if addr in image_addrs:
+              episode.add(f'policy_{key}', value, agg='stack')
+          else:
+            first_addr = next(iter(episodes.keys()))
+            if addr == first_addr:
+              episode.add(f'policy_{key}', value, agg='stack')
         elif key.startswith('log/'):
           assert value.ndim == 0, (key, value.shape, value.dtype)
           episode.add(key + '/avg', value, agg='avg')
@@ -381,14 +402,21 @@ def parallel_logger(make_logger, args):
           episode.add(key + '/sum', value, agg='sum')
       if tran['is_last']:
         result = episode.result()
-        logger.add({
-            'score': result.pop('score'),
-            'length': result.pop('length') - 1,
-        }, prefix='episode')
+        score = result.pop('score')
+        length = result.pop('length') - 1
         rew = result.pop('rewards')
         if len(rew) > 1:
           result['reward_rate'] = (np.abs(rew[1:] - rew[:-1]) >= 0.01).mean()
-        epstats.add(result)
+        if task_map and addr in task_map:
+          task_name = task_map[addr]
+          logger.add({'score': score, 'length': length},
+                     prefix=f'episode/{task_name}')
+          task_epstats[task_name].add(result)
+          epstats.add({k: v for k, v in result.items()
+                       if not k.startswith('policy_')})
+        else:
+          logger.add({'score': score, 'length': length}, prefix='episode')
+          epstats.add(result)
 
     for addr, last in list(updated.items()):
       if now - last >= args.episode_timeout:
@@ -409,6 +437,8 @@ def parallel_logger(make_logger, args):
         logger.add({'timer/logger': elements.timer.stats()['summary']})
         logger.add(parallel.result(), prefix='parallel')
         logger.add(epstats.result(), prefix='epstats')
+        for task_name, agg in task_epstats.items():
+          logger.add(agg.result(), prefix=f'epstats/{task_name}')
         logger.add(usage.stats(), prefix='usage/logger')
         logger.add(server.stats(), prefix='server/logger')
       if logger.step == last_step:

@@ -28,6 +28,17 @@ def train(
   task_epstats = collections.defaultdict(elements.Agg) if task_map else {}
   task_latest = {}  # most recent episode stats per task, for computing mean
 
+  # Determine which workers capture images (one per task, or worker 0)
+  if task_map:
+    image_workers = set()
+    seen_tasks = set()
+    for w in sorted(task_map):
+      if task_map[w] not in seen_tasks:
+        image_workers.add(w)
+        seen_tasks.add(task_map[w])
+  else:
+    image_workers = {0}
+
   batch_steps = args.batch_size * args.batch_length
   should_train = elements.when.Ratio(args.train_ratio / batch_steps)
   should_log = embodied.LocalClock(args.log_every)
@@ -43,7 +54,7 @@ def train(
     episode.add('rewards', tran['reward'], agg='stack')
     for key, value in tran.items():
       if value.dtype == np.uint8 and value.ndim == 3:
-        if worker == 0:
+        if worker in image_workers:
           episode.add(f'policy_{key}', value, agg='stack')
       elif key.startswith('log/'):
         assert value.ndim == 0, (key, value.shape, value.dtype)
@@ -59,19 +70,18 @@ def train(
       if len(rew) > 1:
         reward_rate = (np.abs(rew[1:] - rew[:-1]) >= 0.01).mean()
         result['reward_rate'] = reward_rate
-      epstats.add(result)
       if not task_map:
+        epstats.add(result)
         logger.add({'score': score, 'length': length}, prefix='episode')
       else:
-        # Per-task logging; update latest and log mean across tasks
+        # Global epstats without images (per-task epstats have them)
+        epstats.add({k: v for k, v in result.items()
+                     if not k.startswith('policy_')})
         if worker in task_map:
           task_name = task_map[worker]
           logger.add({'score': score, 'length': length},
                      prefix=f'episode/{task_name}')
-          task_result = {}
-          if reward_rate is not None:
-            task_result['reward_rate'] = reward_rate
-          task_epstats[task_name].add(task_result)
+          task_epstats[task_name].add(result)
           task_latest[task_name] = {'score': score, 'length': length}
         if task_latest:
           mean_score = np.mean([v['score'] for v in task_latest.values()])
