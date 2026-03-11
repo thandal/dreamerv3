@@ -56,6 +56,11 @@ def main(argv=None):
   tasks = _get_tasks(config)
   if tasks:
     num_envs = config.run.envs
+    if num_envs % len(tasks) != 0:
+      raise ValueError(
+          f'run.envs ({num_envs}) must be a multiple of the number of tasks '
+          f'({len(tasks)}). Use envs={len(tasks)} or envs={2 * len(tasks)}, etc. '
+          f'Tasks: {tasks}')
     strategy = config.multitask.strategy
     assignments = embodied.multitask.assign_tasks(
         tasks, num_envs, strategy, seed=config.seed)
@@ -114,7 +119,7 @@ def main(argv=None):
         bind(_make_env_fn, config),
         bind(make_stream, config),
         bind(make_logger, config),
-        args)
+        args, task_assignments=task_assignments)
 
   elif config.script == 'parallel_env':
     is_eval = config.replica >= args.envs
