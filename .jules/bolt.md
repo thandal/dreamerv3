@@ -1,0 +1,3 @@
+## 2025-03-10 - Replace Python loops over time dimension with jax.lax.scan in returns computation
+**Learning:** Using Python `for` loops in sequence computations (like backward passes for returns or GAE) causes the JAX computation graph to unroll over the time dimension. This leads to an O(T) node graph size, which drastically increases `jax.jit` compilation speed and memory footprint.
+**Action:** Always replace Python loops over the time dimension with JAX-native operations like `jax.lax.scan` (using `reverse=True` for backward passes). This keeps the node graph size O(1) during JIT compilation.
