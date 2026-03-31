@@ -1,0 +1,3 @@
+## 2025-05-24 - JAX Compilation Bottleneck from Python Loops
+**Learning:** In sequence computations like backward passes for returns (`LambdaReturn`) or generalized advantage estimation (`GAE`), using a Python `for` loop over the time dimension causes JAX to unroll the loop during tracing. This results in an HLO node graph size that grows linearly with the sequence length (O(T)), leading to drastically increased memory footprint and extremely slow compilation times for `jax.jit`.
+**Action:** Replace Python loops over sequence dimensions with JAX-native operations like `jax.lax.scan` (using `reverse=True` for backward passes). This keeps the node graph size O(1) and ensures optimal compilation speed and memory usage while preserving runtime performance.
