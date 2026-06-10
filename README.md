@@ -59,7 +59,7 @@ follow the manual instructions below.
 
 ## Manual
 
-Set up python virtual environment and install dependencies:
+Set up conda environment and install dependencies:
 
 ```sh
 python -m venv python_env
@@ -96,8 +96,8 @@ Optionally also set WANDB_PROJECT, if desired.
 ```sh
 docker build -f Dockerfile-base -t than6785/dreamer-base .
 docker push than6785/dreamer-base 
-docker build -f Dockerfile -t than6785/dreamer:n1 .
-docker push than6785/dreamer:n1
+docker build -f Dockerfile -t than6785/dreamer .
+docker push than6785/dreamer
 ```
 
 Then to launch with the first matching instance:

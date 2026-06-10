@@ -62,6 +62,10 @@ defaults:
     steps: 1e10
     duration: 0
     train_ratio: 32.0
+    train_ratio_schedule: 'constant' # 'constant', 'linear', or 'dyn_loss_relative'
+    train_ratio_min: 16.0
+    train_ratio_max: 512.0
+    train_ratio_ema_alpha: 0.99
     log_every: 120
     report_every: 300
     save_every: 900

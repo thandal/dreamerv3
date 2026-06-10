@@ -2,7 +2,14 @@ set -e
 
 cleanup() {
   echo "Cleaning up..."
-  vastai destroy instance "$CONTAINER_ID"
+  if [ "$NO_DESTROY" = "1" ]; then
+    echo "NO_DESTROY=1 is set. Skipping instance destruction."
+    echo "Instance $CONTAINER_ID will remain active. Remember to destroy it manually!"
+    # Sleep indefinitely to keep the container alive
+    sleep infinity
+  else
+    vastai destroy instance "$CONTAINER_ID"
+  fi
 }
 trap cleanup EXIT
 

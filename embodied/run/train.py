@@ -101,9 +101,18 @@ def train(
   carry_train = [agent.init_train(args.batch_size)]
   carry_report = agent.init_report(args.batch_size)
 
+  # Dynamic train ratio state
+  dyn_ratio_state = {'ema_loss': None, 'max_loss': 0.0}
+
   def trainfn(tran, worker):
     if len(replay) < args.batch_size * args.batch_length:
       return
+    
+    if getattr(args, 'train_ratio_schedule', 'constant') == 'linear':
+      progress = int(step) / args.steps
+      new_ratio = args.train_ratio_min + progress * (args.train_ratio_max - args.train_ratio_min)
+      should_train._ratio = new_ratio / batch_steps
+
     for _ in range(should_train(step)):
       with elements.timer.section('stream_next'):
         batch = next(stream_train)
@@ -111,7 +120,29 @@ def train(
       train_fps.step(batch_steps)
       if 'replay' in outs:
         replay.update(outs['replay'])
+        
+      if getattr(args, 'train_ratio_schedule', 'constant') == 'dyn_loss_relative':
+        if 'loss/dyn' in mets:
+          current_loss = float(np.mean(mets['loss/dyn']))
+          if dyn_ratio_state['ema_loss'] is None:
+            dyn_ratio_state['ema_loss'] = current_loss
+          else:
+            alpha = getattr(args, 'train_ratio_ema_alpha', 0.99)
+            dyn_ratio_state['ema_loss'] = alpha * dyn_ratio_state['ema_loss'] + (1 - alpha) * current_loss
+          
+          if dyn_ratio_state['ema_loss'] > dyn_ratio_state['max_loss']:
+            dyn_ratio_state['max_loss'] = dyn_ratio_state['ema_loss']
+          
+          if dyn_ratio_state['max_loss'] > 0:
+            rel = dyn_ratio_state['ema_loss'] / dyn_ratio_state['max_loss']
+            new_ratio = args.train_ratio_min + (args.train_ratio_max - args.train_ratio_min) * (1.0 - rel)
+            new_ratio = max(args.train_ratio_min, min(args.train_ratio_max, new_ratio))
+            should_train._ratio = new_ratio / batch_steps
+
+      # Log the current actual ratio being used
+      train_agg.add({'train_ratio': should_train._ratio * batch_steps}, prefix='train')
       train_agg.add(mets, prefix='train')
+      
   driver.on_step(trainfn)
 
   cp = elements.Checkpoint(logdir / 'ckpt')
