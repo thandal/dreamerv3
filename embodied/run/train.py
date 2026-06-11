@@ -109,7 +109,11 @@ def train(
       return
     
     if getattr(args, 'train_ratio_schedule', 'constant') == 'linear':
-      progress = int(step) / args.steps
+      warmup = getattr(args, 'train_ratio_warmup_steps', 0)
+      if warmup > 0:
+        progress = min(1.0, int(step) / warmup)
+      else:
+        progress = int(step) / args.steps
       new_ratio = args.train_ratio_min + progress * (args.train_ratio_max - args.train_ratio_min)
       should_train._ratio = new_ratio / batch_steps
 

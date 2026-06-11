@@ -29,7 +29,7 @@ defaults:
   env:
     atari: {size: [96, 96], repeat: 4, sticky: True, gray: True, actions: all, lives: unused, noops: 30, autostart: False, pooling: 2, aggregate: max, resize: pillow, clip_reward: False}
     procgen: {size: [96, 96], resize: pillow}
-    crafter: {size: [64, 64], logs: False}
+    crafter: {size: [64, 64], logs: False, use_logdir: False}
     atari100k: {size: [64, 64], repeat: 4, sticky: False, gray: False, actions: needed, lives: unused, noops: 30, autostart: False, resize: pillow, clip_reward: False}
     dmlab: {size: [64, 64], repeat: 4, episodic: True, use_seed: True}
     minecraft: {size: [64, 64], break_speed: 100.0, logs: False, length: 36000}
@@ -66,14 +66,16 @@ defaults:
     train_ratio_min: 16.0
     train_ratio_max: 512.0
     train_ratio_ema_alpha: 0.99
+    train_ratio_warmup_steps: 0  # If >0, linear schedule ramps over this many steps (then holds at max)
     log_every: 120
-    report_every: 300
+    report_every: 1200
     save_every: 900
     envs: 16
     eval_envs: 4
     eval_eps: 1
     report_batches: 1
     from_checkpoint: ''
+    from_checkpoint_regex: ''  # If set, only load params matching this regex (e.g. '^wm/' for world model only)
     episode_timeout: 180
     actor_addr: 'localhost:{auto}'
     replay_addr: 'localhost:{auto}'

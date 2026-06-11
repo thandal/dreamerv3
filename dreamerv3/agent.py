@@ -135,9 +135,15 @@ class ActorCritic(nj.Module):
         embodied.jax.MLPHead(scalar, **config.value, name='slowval'),
         source=self.val, **config.slowvalue)
 
-    tasks = getattr(getattr(config, 'multitask', None), 'tasks', ['none'])
+    multitask = getattr(config, 'multitask', None)
+    tasks = getattr(multitask, 'tasks', ['none'])
     num_tasks = len(tasks) if tasks != ['none'] else 1
-    if num_tasks > 1:
+    # Must mirror the call sites (imag_loss/replay_loss): they only pass
+    # task_ids when the batch carries them, which requires
+    # task_id_for_normalization. Otherwise PerTaskNormalize would be built
+    # but called without task ids and crash.
+    norm_ids = getattr(multitask, 'task_id_for_normalization', True)
+    if num_tasks > 1 and norm_ids:
       self.retnorm = embodied.jax.PerTaskNormalize(
           num_tasks, **config.retnorm, name='retnorm')
     else:

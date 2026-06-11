@@ -17,6 +17,21 @@ FROM than6785/dreamer-base
 ##RUN pip install https://github.com/danijar/minerl/releases/download/v0.4.4-patched/minerl_mirror-0.4.4-cp311-cp311-linux_x86_64.whl
 ##RUN chown -R 1000:root /venv/lib/python3.11/site-packages/minerl
 
+# Vast.ai SSH Flakiness Fix:
+# Vast's internal `/.launch` script tries to install openssh-server on the fly via `apt-get` during container boot.
+# This frequently fails or times out when multiple instances are launched or Ubuntu mirrors are slow, causing
+# the SSH daemon to never start (even when the container and your code are running perfectly fine).
+# By baking openssh-server into our image here, Vast's launch script will successfully find and start the daemon
+# even if its own `apt-get` update step fails.
+RUN export DEBIAN_FRONTEND=noninteractive && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends openssh-server tmux rsync curl less && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Tailscale
+RUN curl -fsSL https://tailscale.com/install.sh | sh
+
 # Source
 RUN mkdir /app
 WORKDIR /app
