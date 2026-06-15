@@ -402,6 +402,59 @@ class Agent(embodied.Agent):
         self.policy_params = internal.move(
             policy_params, self.policy_params_sharding)
 
+  @elements.timer.section('jaxagent_reset_params')
+  def reset_params(self, regex):
+    """Re-initialize params matching regex, plus their optimizer state.
+
+    SPR/SR-SPR-style periodic resets. Fresh values come from a full re-init
+    with a per-reset seed offset, so each reset draws new random weights.
+    Optimizer moments embed the param key (opt/state/<pos>/<param_key>), so
+    the matching slots are reset to their fresh (zero) state as well.
+    """
+    assert regex, 'reset_params needs a non-empty regex'
+    pattern = re.compile(regex)
+    self._n_resets = getattr(self, '_n_resets', 0) + 1
+
+    with contextlib.ExitStack() as stack:
+      stack.enter_context(self.train_lock)
+      stack.enter_context(self.policy_lock)
+
+      with self.train_mesh:
+        fresh, _ = self._init_params(seed_offset=self._n_resets)
+
+      param_keys = [
+          k for k in self.params
+          if not k.startswith('opt/') and pattern.match(k)]
+      assert param_keys, (regex, sorted(self.params.keys()))
+      opt_keys = [
+          k for k in self.params if k.startswith('opt/state/') and
+          any(k.endswith('/' + pk) for pk in param_keys)]
+      keys = set(param_keys + opt_keys)
+
+      for k in keys:
+        new = jax.device_put(
+            jax.device_get(fresh[k]), self.params[k].sharding)
+        self.params[k].delete()
+        self.params[k] = new
+      jax.tree.map(lambda x: x.delete(), fresh)
+
+      if self.jaxcfg.enable_policy:
+        # Discard any pending sync captured before the reset, then rebuild
+        # the policy copy from the (partially) fresh train params.
+        if self.pending_sync:
+          jax.tree.map(lambda x: x.delete(), self.pending_sync)
+          self.pending_sync = None
+        jax.tree.map(lambda x: x.delete(), self.policy_params)
+        policy_params = {
+            k: self.params[k].copy() for k in self.policy_keys}
+        self.policy_params = internal.move(
+            policy_params, self.policy_params_sharding)
+
+    elements.print(
+        f'Reset {len(param_keys)} param tensors (+{len(opt_keys)} optimizer '
+        f'slots) matching {regex!r}', color='yellow')
+    return sorted(keys)
+
   def _take_outs(self, outs):
     outs = jax.tree.map(lambda x: x.__array__(), outs)
     outs = jax.tree.map(
@@ -413,7 +466,7 @@ class Agent(embodied.Agent):
     seeds = rng.integers(0, np.iinfo(np.uint32).max, (2,), np.uint32)
     return internal.device_put(seeds, sharding)
 
-  def _init_params(self):
+  def _init_params(self, seed_offset=0):
     B = min(self.config.batch_size, len(self.jaxcfg.train_devices))
     GB = B * jax.process_count()
     T = self.config.batch_length
@@ -422,7 +475,8 @@ class Agent(embodied.Agent):
     us = self.jaxcfg.use_shardmap
 
     with jax._src.config.explicit_device_get_scope():
-      seed = jax.device_put(np.array([self.config.seed, 0], np.uint32), tm)
+      seed = jax.device_put(
+          np.array([self.config.seed + seed_offset, 0], np.uint32), tm)
     data = internal.device_put(self._zeros(self.spaces, (B, T + C)), ts)
     pr, ar = self.partition_rules
 

@@ -44,6 +44,9 @@ def train(
   should_log = embodied.LocalClock(args.log_every)
   should_report = embodied.LocalClock(args.report_every)
   should_save = embodied.LocalClock(args.save_every)
+  # Periodic parameter resets (SPR/SR-SPR-style high-UTD intervention).
+  should_reset = elements.when.Every(args.reset_every, initial=False)
+  reset_count = 0
 
   @elements.timer.section('logfn')
   def logfn(tran, worker):
@@ -164,6 +167,13 @@ def train(
   while step < args.steps:
 
     driver(policy, steps=10)
+
+    if args.reset_every and should_reset(step):
+      agent.reset_params(args.reset_regex)
+      reset_count += 1
+      print(f'Periodic reset #{reset_count} ({args.reset_regex!r}) '
+            f'at step {int(step)}')
+      train_agg.add({'reset_count': reset_count}, prefix='train')
 
     if should_report(step) and len(replay):
       agg = elements.Agg()

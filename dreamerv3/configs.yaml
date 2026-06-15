@@ -76,6 +76,8 @@ defaults:
     report_batches: 1
     from_checkpoint: ''
     from_checkpoint_regex: ''  # If set, only load params matching this regex (e.g. '^wm/' for world model only)
+    reset_every: 0  # If >0, re-init params matching reset_regex every N env steps (SPR/SR-SPR periodic resets)
+    reset_regex: '^ac/'  # What to reset; '^ac/' = full actor-critic incl. slow target and retnorm
     episode_timeout: 180
     actor_addr: 'localhost:{auto}'
     replay_addr: 'localhost:{auto}'
