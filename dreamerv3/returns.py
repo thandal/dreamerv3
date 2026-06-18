@@ -95,11 +95,21 @@ class LambdaReturn(ReturnComputer):
         # Intermediate value: immediate reward + (1-λ) * bootstrapped value
         interm = rew[:, 1:] + (1 - cont) * live * boot[:, 1:]
 
-        # Backward pass to compute returns
-        for t in reversed(range(live.shape[1])):
-            rets.append(interm[:, t] + live[:, t] * cont[:, t] * rets[-1])
+        # ⚡ Bolt: Replace O(T) Python loop with O(1) jax.lax.scan to prevent
+        # JAX from unrolling the HLO graph during jit compilation.
+        def _step(carry, inputs):
+            interm_t, live_t, cont_t = inputs
+            ret_t = interm_t + live_t * cont_t * carry
+            return ret_t, ret_t
 
-        return jnp.stack(list(reversed(rets))[:-1], 1)
+        _, rets = jax.lax.scan(
+            _step,
+            boot[:, -1],
+            (interm.T, live.T, cont.T),
+            reverse=True
+        )
+
+        return rets.T
 
 
 class NStepReturn(ReturnComputer):
@@ -269,15 +279,20 @@ class GAE(ReturnComputer):
         live = (1 - f32(term))[:, 1:] * disc
         td_errors = rew[:, 1:] + live * next_val - val[:, :-1]
 
-        # Compute GAE advantages via backward pass
-        advs = []
-        gae = jnp.zeros(val.shape[0], dtype=f32)
+        # ⚡ Bolt: Replace O(T) Python loop with O(1) jax.lax.scan to prevent
+        # JAX from unrolling the HLO graph during jit compilation.
+        def _step(carry, inputs):
+            td_t, live_t, last_t_p1 = inputs
+            gae_t = td_t + live_t * lam * carry * last_t_p1
+            return gae_t, gae_t
 
-        for t in reversed(range(td_errors.shape[1])):
-            gae = td_errors[:, t] + live[:, t] * lam * gae * (1 - f32(last)[:, t + 1])
-            advs.append(gae)
-
-        advs = jnp.stack(list(reversed(advs)), 1)
+        _, advs = jax.lax.scan(
+            _step,
+            jnp.zeros(val.shape[0], dtype=f32),
+            (td_errors.T, live.T, (1 - f32(last))[:, 1:].T),
+            reverse=True
+        )
+        advs = advs.T
 
         # Returns = advantages + values
         returns = advs + val[:, :-1]
