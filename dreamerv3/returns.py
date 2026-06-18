@@ -84,7 +84,7 @@ class LambdaReturn(ReturnComputer):
         chex.assert_equal_shape((last, term, rew, val, boot))
 
         # Start from the last bootstrap value
-        rets = [boot[:, -1]]
+        init_ret = boot[:, -1]
 
         # Compute effective discount accounting for termination
         live = (1 - f32(term))[:, 1:] * disc
@@ -92,14 +92,21 @@ class LambdaReturn(ReturnComputer):
         # Continuation weight (0 at episode boundaries)
         cont = (1 - f32(last))[:, 1:] * lam
 
-        # Intermediate value: immediate reward + (1-λ) * bootstrapped value
+        # Intermediate value: imm. reward + (1-λ) * bootstrapped value
         interm = rew[:, 1:] + (1 - cont) * live * boot[:, 1:]
 
-        # Backward pass to compute returns
-        for t in reversed(range(live.shape[1])):
-            rets.append(interm[:, t] + live[:, t] * cont[:, t] * rets[-1])
+        # Backward pass using jax.lax.scan (O(T) compilation)
+        def step(ret_next, inputs):
+            interm_t, live_t, cont_t = inputs
+            ret_t = interm_t + live_t * cont_t * ret_next
+            return ret_t, ret_t
 
-        return jnp.stack(list(reversed(rets))[:-1], 1)
+        # jax.lax.scan iterates over the first axis, so we transpose.
+        # reverse=True simulates a backward pass over time.
+        inputs = (interm.T, live.T, cont.T)
+        _, rets = jax.lax.scan(step, init_ret, inputs, reverse=True)
+
+        return rets.T
 
 
 class NStepReturn(ReturnComputer):
@@ -130,7 +137,7 @@ class NStepReturn(ReturnComputer):
             val: Value predictions (B, T)
             boot: Bootstrap values (B, T)
             disc: Discount factor
-            n: Override N (default: use self.n)
+            n: Override N (default: self.n)
 
         Returns:
             Returns (B, T-1)
@@ -154,8 +161,15 @@ class NStepReturn(ReturnComputer):
                 ret = ret + discount * r
 
                 # Stop at episode boundaries or terminals
-                l = jnp.where(valid, (1 - f32(term[:, safe_idx])) * (1 - f32(last[:, safe_idx])), 0.0)
-                next_discount = jnp.where(valid, discount * disc * l, discount)
+                live_k = jnp.where(
+                    valid,
+                    (1 - f32(term[:, safe_idx])) *
+                    (1 - f32(last[:, safe_idx])),
+                    0.0
+                )
+                next_discount = jnp.where(
+                    valid, discount * disc * live_k, discount
+                )
 
                 return (ret, next_discount), None
 
@@ -175,7 +189,7 @@ class NStepReturn(ReturnComputer):
 class MonteCarloReturn(ReturnComputer):
     """Monte Carlo returns (full episode rewards).
 
-    Computes returns using all rewards until episode end, without bootstrapping:
+    Computes returns using all rewards until episode end, no bootstrapping:
         ret_t = r_t + γ*r_{t+1} + γ^2*r_{t+2} + ... + γ^{T-t}*r_T
 
     This has zero bias but high variance.
@@ -187,7 +201,7 @@ class MonteCarloReturn(ReturnComputer):
     """
 
     def compute(self, last, term, rew, val, boot, disc, **kwargs):
-        """Compute Monte Carlo returns.
+        """Compute MC returns.
 
         Args:
             last: Episode boundaries (B, T)
@@ -203,23 +217,21 @@ class MonteCarloReturn(ReturnComputer):
         chex.assert_equal_shape((last, term, rew, val, boot))
 
         B, T = rew.shape
-        rets = []
 
-        # Start from the end and work backwards
-        for t in range(T - 1):
-            ret = jnp.zeros(B, dtype=f32)
-            discount = 1.0
+        # MC returns use all future rewards. No bootstrap.
+        live = (1 - f32(term))[:, 1:] * (1 - f32(last))[:, 1:]
 
-            for k in range(t + 1, T):
-                ret = ret + discount * rew[:, k]
+        # Backward pass using jax.lax.scan (O(T) compilation)
+        def step(ret_next, inputs):
+            rew_t, live_t = inputs
+            ret_t = rew_t + disc * live_t * ret_next
+            return ret_t, ret_t
 
-                # Stop at episode boundaries or terminals
-                live = (1 - f32(term[:, k])) * (1 - f32(last[:, k]))
-                discount = discount * disc * live
+        inputs = (rew[:, 1:].T, live.T)
+        init_ret = jnp.zeros(B, dtype=f32)
+        _, rets = jax.lax.scan(step, init_ret, inputs, reverse=True)
 
-            rets.append(ret)
-
-        return jnp.stack(rets, 1)
+        return rets.T
 
 
 class GAE(ReturnComputer):
@@ -231,10 +243,12 @@ class GAE(ReturnComputer):
 
     Returns are then: ret_t = A_t + V_t
 
-    This is the standard method used in PPO and other policy gradient algorithms.
+    This is the standard method used in PPO and other policy gradient
+    algorithms.
 
     Reference:
-        Schulman et al. (2016) - "High-Dimensional Continuous Control Using GAE"
+        Schulman et al. (2016) - "High-Dimensional Continuous Control
+        Using GAE"
 
     Args:
         lam: GAE lambda parameter (default: 0.95)
@@ -255,7 +269,7 @@ class GAE(ReturnComputer):
             val: Value predictions (B, T)
             boot: Bootstrap values (B, T)
             disc: Discount factor
-            lam: Override lambda (default: use self.lam)
+            lam: Override lambda (default: self.lam)
 
         Returns:
             Returns (B, T-1)
@@ -269,15 +283,16 @@ class GAE(ReturnComputer):
         live = (1 - f32(term))[:, 1:] * disc
         td_errors = rew[:, 1:] + live * next_val - val[:, :-1]
 
-        # Compute GAE advantages via backward pass
-        advs = []
-        gae = jnp.zeros(val.shape[0], dtype=f32)
+        # Compute GAE advantages via backward pass using scan (O(T))
+        def step(gae_next, inputs):
+            td_t, live_t, last_t = inputs
+            gae_t = td_t + live_t * lam * gae_next * (1 - last_t)
+            return gae_t, gae_t
 
-        for t in reversed(range(td_errors.shape[1])):
-            gae = td_errors[:, t] + live[:, t] * lam * gae * (1 - f32(last)[:, t + 1])
-            advs.append(gae)
-
-        advs = jnp.stack(list(reversed(advs)), 1)
+        inputs = (td_errors.T, live.T, f32(last)[:, 1:].T)
+        init_gae = jnp.zeros(val.shape[0], dtype=f32)
+        _, advs = jax.lax.scan(step, init_gae, inputs, reverse=True)
+        advs = advs.T
 
         # Returns = advantages + values
         returns = advs + val[:, :-1]
@@ -298,20 +313,21 @@ def create_return_computer(strategy: str, **kwargs):
     """Factory function to create a return computer.
 
     Args:
-        strategy: Return computation strategy ('lambda', 'nstep', 'montecarlo', 'gae')
+        strategy: Return computation strategy ('lambda', 'nstep',
+                  'montecarlo', 'gae')
         **kwargs: Strategy-specific parameters
 
     Returns:
         ReturnComputer instance
 
     Example:
-        >>> computer = create_return_computer('lambda', lam=0.95)
-        >>> returns = computer.compute(last, term, rew, val, boot, disc)
+        >>> comp = create_return_computer('lambda', lam=0.95)
+        >>> returns = comp.compute(last, term, rew, val, boot, disc)
     """
     if strategy not in RETURN_COMPUTERS:
+        avails = list(RETURN_COMPUTERS.keys())
         raise ValueError(
-            f"Unknown return strategy: {strategy}. "
-            f"Available strategies: {list(RETURN_COMPUTERS.keys())}"
+            f"Unknown strategy: {strategy}. Available: {avails}"
         )
 
     return RETURN_COMPUTERS[strategy](**kwargs)
