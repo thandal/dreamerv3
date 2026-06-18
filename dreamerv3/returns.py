@@ -95,11 +95,19 @@ class LambdaReturn(ReturnComputer):
         # Intermediate value: immediate reward + (1-λ) * bootstrapped value
         interm = rew[:, 1:] + (1 - cont) * live * boot[:, 1:]
 
-        # Backward pass to compute returns
-        for t in reversed(range(live.shape[1])):
-            rets.append(interm[:, t] + live[:, t] * cont[:, t] * rets[-1])
+        # Backward pass to compute returns using scan to avoid JAX unrolling
+        def step(ret, inputs):
+            interm_t, live_t, cont_t = inputs
+            next_ret = interm_t + live_t * cont_t * ret
+            return next_ret, next_ret
 
-        return jnp.stack(list(reversed(rets))[:-1], 1)
+        inputs = (
+            jnp.transpose(interm, (1, 0)),
+            jnp.transpose(live, (1, 0)),
+            jnp.transpose(cont, (1, 0))
+        )
+        _, rets = jax.lax.scan(step, boot[:, -1], inputs, reverse=True)
+        return jnp.transpose(rets, (1, 0))
 
 
 class NStepReturn(ReturnComputer):
@@ -203,23 +211,20 @@ class MonteCarloReturn(ReturnComputer):
         chex.assert_equal_shape((last, term, rew, val, boot))
 
         B, T = rew.shape
-        rets = []
 
-        # Start from the end and work backwards
-        for t in range(T - 1):
-            ret = jnp.zeros(B, dtype=f32)
-            discount = 1.0
+        live = (1 - f32(term)) * (1 - f32(last))
 
-            for k in range(t + 1, T):
-                ret = ret + discount * rew[:, k]
+        def step(ret, inputs):
+            rew_t, live_t = inputs
+            ret = rew_t + disc * live_t * ret
+            return ret, ret
 
-                # Stop at episode boundaries or terminals
-                live = (1 - f32(term[:, k])) * (1 - f32(last[:, k]))
-                discount = discount * disc * live
-
-            rets.append(ret)
-
-        return jnp.stack(rets, 1)
+        inputs = (
+            jnp.transpose(rew[:, 1:], (1, 0)),
+            jnp.transpose(live[:, 1:], (1, 0))
+        )
+        _, rets = jax.lax.scan(step, jnp.zeros(B, dtype=f32), inputs, reverse=True)
+        return jnp.transpose(rets, (1, 0))
 
 
 class GAE(ReturnComputer):
@@ -269,15 +274,21 @@ class GAE(ReturnComputer):
         live = (1 - f32(term))[:, 1:] * disc
         td_errors = rew[:, 1:] + live * next_val - val[:, :-1]
 
-        # Compute GAE advantages via backward pass
-        advs = []
-        gae = jnp.zeros(val.shape[0], dtype=f32)
+        # Compute GAE advantages via backward pass using scan
+        not_last = 1 - f32(last)[:, 1:]
 
-        for t in reversed(range(td_errors.shape[1])):
-            gae = td_errors[:, t] + live[:, t] * lam * gae * (1 - f32(last)[:, t + 1])
-            advs.append(gae)
+        def step(gae, inputs):
+            td_t, live_t, not_last_t = inputs
+            gae = td_t + live_t * lam * gae * not_last_t
+            return gae, gae
 
-        advs = jnp.stack(list(reversed(advs)), 1)
+        inputs = (
+            jnp.transpose(td_errors, (1, 0)),
+            jnp.transpose(live, (1, 0)),
+            jnp.transpose(not_last, (1, 0))
+        )
+        _, advs = jax.lax.scan(step, jnp.zeros(val.shape[0], dtype=f32), inputs, reverse=True)
+        advs = jnp.transpose(advs, (1, 0))
 
         # Returns = advantages + values
         returns = advs + val[:, :-1]
