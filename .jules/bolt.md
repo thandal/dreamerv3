@@ -1,0 +1,3 @@
+## 2024-05-18 - Replacing Python `for` loops with `jax.lax.scan`
+**Learning:** In JAX, standard Python `for` loops used for sequence computations (like backward passes for returns or GAE) are fully unrolled during `jax.jit` compilation. This creates an O(T) node graph size, which significantly slows down compilation time and consumes more memory, especially for long trajectories.
+**Action:** Always replace Python `for` loops over the time dimension with JAX-native control flow primitives like `jax.lax.scan` (with `reverse=True` for backward passes). This ensures the graph size is O(1) during JIT compilation, drastically improving compilation speed and reducing memory footprint without changing computational complexity.
