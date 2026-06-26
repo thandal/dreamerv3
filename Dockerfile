@@ -5,11 +5,11 @@
 
 FROM than6785/dreamer-base
 
-# Envs
+# Envs (base already has ale_py/autorom + dm_control; crafter needed for Tier 1+)
+RUN pip install crafter
 ##RUN wget -O - https://gist.githubusercontent.com/danijar/ca6ab917188d2e081a8253b3ca5c36d3/raw/install-dmlab.sh | sh
 ##RUN pip install ale_py==0.9.0 autorom[accept-rom-license]==0.6.1
 ##RUN pip install procgen_mirror
-##RUN pip install crafter
 #RUN pip install dm_control
 ##RUN pip install memory_maze
 ##ENV MUJOCO_GL=egl

@@ -97,9 +97,30 @@ class WorldModel(nj.Module):
     self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew')
     self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con')
 
+    # Plan2Explore (Tier 4c): ensemble of one-step latent predictors. Each member
+    # regresses the next deterministic latent from (feat_t, act_t); the VARIANCE of
+    # their predictions (epistemic disagreement) is an intrinsic exploration
+    # reward. Disabled (zero overhead) unless config.disag.size > 0.
+    self.disag_cfg = getattr(config, 'disag', None)
+    self.disag_size = int(getattr(self.disag_cfg, 'size', 0)) if self.disag_cfg else 0
+    if self.disag_size > 0:
+      self.disag_dim = config.dyn[config.dyn.typ].deter  # predict next deter
+      disag_space = elements.Space(np.float32, (self.disag_dim,))
+      self.disag_heads = [
+          embodied.jax.MLPHead(disag_space, **config.disaghead, name=f'disag{i}')
+          for i in range(self.disag_size)]
+      self.disag_act = nn.DictConcat(act_space, 1)  # action dict -> flat tensor
+    else:
+      self.disag_heads = []
+      self.disag_act = None
+
     scales = config.loss_scales.copy()
     rec = scales.pop('rec')
     scales.update({k: rec for k in dec_space})
+    if self.disag_size > 0:
+      # Add the ensemble training loss to scales iff enabled, so the
+      # losses-keys == scales-keys invariant in loss() holds either way.
+      scales['disag'] = float(getattr(self.disag_cfg, 'scale', 1.0))
     self.scales = scales
 
   def initial(self, batch_size):
@@ -181,6 +202,11 @@ class Agent(embodied.jax.Agent):
     self.con = self.wm.con
     self.feat2tensor = self.wm.feat2tensor
     self.scales = self.wm.scales
+    # Plan2Explore ensemble (Tier 4c); empty list when disag.size == 0.
+    self.disag_heads = self.wm.disag_heads
+    self.disag_size = self.wm.disag_size
+    self.disag_act = self.wm.disag_act
+    self.disag_cfg = self.wm.disag_cfg
 
     self.pol = self.ac.pol
     self.bc_pol = self.ac.bc_pol
@@ -194,6 +220,7 @@ class Agent(embodied.jax.Agent):
         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
     if self.bc_pol is not None:
       self.modules.append(self.bc_pol)
+    self.modules += self.disag_heads  # Tier 4c Plan2Explore ensemble (may be empty)
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
@@ -359,6 +386,25 @@ class Agent(embodied.jax.Agent):
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
     inp = self.feat2tensor(imgfeat)
+
+    # Reward fed to the actor-critic over the imagined rollout. Normally the
+    # learned task-reward head; under Plan2Explore reward-free pretraining
+    # (Tier 4c) it is the ensemble DISAGREEMENT (variance of the K next-deter
+    # predictions, averaged over dims) — an intrinsic exploration bonus that needs
+    # no task reward and is defined at every imagined step. sg() so the policy
+    # gradient does not flow back into the ensemble (it is trained by its own MSE
+    # loss on real transitions below).
+    imag_reward = self.rew(inp, 2).pred()
+    if self.disag_size > 0:
+      act_flat = self.disag_act(imgact)                       # (B*K, H+1, A)
+      di = jnp.concatenate([inp, act_flat], -1)               # (B*K, H+1, F+A)
+      preds = jnp.stack([h(di, 2).pred() for h in self.disag_heads], 0)
+      disag = preds.var(0).mean(-1)                           # (B*K, H+1)
+      metrics['disag/reward'] = disag.mean()
+      if getattr(self.disag_cfg, 'reward_free', False):
+        intr_scale = float(getattr(self.disag_cfg, 'intr_scale', 1.0))
+        imag_reward = sg(disag) * intr_scale
+
     imag_loss_fn = imag_loss_pmpo if getattr(
         self.config, 'imag_loss_type', 'reinforce') == 'pmpo' else imag_loss
     # Build extra kwargs for PMPO (bc_policy)
@@ -371,7 +417,7 @@ class Agent(embodied.jax.Agent):
       imag_extra['bc_policy'] = {k: _freeze_dist(v) for k, v in bc_dists.items()}
     los, imgloss_out, mets = imag_loss_fn(
         imgact,
-        self.rew(inp, 2).pred(),
+        imag_reward,
         self.con(inp, 2).prob(1),
         self.pol(inp, 2),
         self.val(inp, 2),
@@ -405,6 +451,27 @@ class Agent(embodied.jax.Agent):
       losses.update(los)
       metrics.update(prefix(mets, 'reploss'))
 
+    # Plan2Explore ensemble training (Tier 4c): each member regresses the next
+    # deterministic latent from (feat_t, act_t) on the REAL replay sequence. The
+    # target is the stop-grad next-step deter, so members agree where the model is
+    # confident and disagree on novel transitions — which drives the intrinsic
+    # reward above. Shaped (B, T) to satisfy the loss-dict invariant; the final
+    # timestep has no next-step target so it is masked to zero.
+    if self.disag_size > 0:
+      feat_seq = self.feat2tensor(repfeat)            # (B, T, F); state_t
+      act_seq = self.disag_act(prevact)               # (B, T, A); act_seq[t] = a_{t-1}
+      # Pair state_t with the action TAKEN from it (a_t = prevact[t+1]) and predict
+      # the resulting next deter — matching the (imgfeat_t, imgact_t) pairing used
+      # for the imagined disagreement reward above.
+      di_in = jnp.concatenate([feat_seq[:, :-1], act_seq[:, 1:]], -1)  # (B, T-1, F+A)
+      target = sg(nn.cast(repfeat['deter']))[:, 1:]   # (B, T-1, deter)
+      member_mse = [
+          ((h(di_in, 2).pred() - target) ** 2).mean(-1)  # (B, T-1)
+          for h in self.disag_heads]
+      disag_bt1 = sum(member_mse) / len(member_mse)
+      losses['disag'] = jnp.concatenate(
+          [disag_bt1, jnp.zeros((B, 1), disag_bt1.dtype)], 1)  # (B, T)
+
     assert set(losses.keys()) == set(self.scales.keys()), (
         sorted(losses.keys()), sorted(self.scales.keys()))
     metrics.update({f'loss/{k}': v.mean() for k, v in losses.items()})
@@ -433,10 +500,18 @@ class Agent(embodied.jax.Agent):
     RB = min(6, B)
     metrics = {}
 
-    # Train metrics
+    # Held-out (validation) metrics: the loss is computed with training=False on
+    # the report stream — a different sample than the train batches. Surfacing the
+    # scalar losses lets the Tier-4a meta-gradient controller read a genuine
+    # held-out objective (e.g. loss/value) rather than a train-batch proxy.
     _, (new_carry, entries, outs, mets) = self.loss(
         carry, obs, prevact, None, training=False)
-    mets.update(mets)
+    metrics.update({k: v for k, v in mets.items()
+                    if isinstance(k, str) and (
+                        k.startswith('loss/') or k in ('ret', 'val'))})
+    # 'val' = mean held-out predicted value (return proxy) and 'ret' = held-out
+    # lambda-return are surfaced so the Tier-4a meta-gradient controller can
+    # descend a RETURN objective instead of value-prediction loss (train.py).
 
     # Grad norms
     if self.config.report_gradnorms:

@@ -62,11 +62,32 @@ defaults:
     steps: 1e10
     duration: 0
     train_ratio: 32.0
-    train_ratio_schedule: 'constant' # 'constant', 'linear', or 'dyn_loss_relative'
+    train_ratio_schedule: 'constant' # 'constant', 'linear', 'dyn_loss_relative', or 'meta_grad'
     train_ratio_min: 16.0
     train_ratio_max: 512.0
     train_ratio_ema_alpha: 0.99
     train_ratio_warmup_steps: 0  # If >0, linear schedule ramps over this many steps (then holds at max)
+    # Meta-gradient train-ratio controller (schedule: meta_grad; Tier 4a). Adjusts
+    # a continuous, log-space train ratio to MAXIMIZE a HELD-OUT return objective:
+    # 'val' = mean predicted value (un-normalized reward scale) on a held-out eval
+    # stream (training=False). The controller probes the ratio with an alternating
+    # +/- dither and estimates the hypergradient by a DRIFT-ROBUST REGRESSION over a
+    # sliding window (obj ~ b0 + b_time*time + b_sign*sign): the smooth training
+    # drift is absorbed by b_time, the probe effect is b_sign -- so it is unbiased
+    # by drift, unlike a two-point difference (2026-06-17 audit + Gemini review).
+    # It runs on its OWN step-based cadence (train.py), decoupled from the slow
+    # video report. Needs run.report=True (default). Earlier-default 'loss/value'
+    # was WRONG (it minimized value-PREDICTION error -> anti-aligned with sample
+    # efficiency); return objectives 'val'/'ret' are negated in train.py to minimize.
+    train_ratio_meta_every: 5000     # env steps between meta-updates (step-based, not report-gated)
+    train_ratio_meta_lr: 0.3         # step size: log-ratio step ~ lr * (b_sign / residual-noise)
+    train_ratio_meta_dither: 0.3     # alternating +/- log-ratio probe amplitude
+    train_ratio_meta_step_clip: 0.1  # max |log-ratio move| per meta-step (one noisy est. can't slam a bound)
+    train_ratio_meta_window: 12      # sliding-window size for the drift-robust regression
+    train_ratio_meta_warmup: 3000    # env steps before the controller starts (let val leave warmup)
+    train_ratio_meta_batches: 1      # held-out report() evals averaged per meta-step (video kept but unlogged)
+    train_ratio_meta_cost: 0.0       # constant downward pull on log-ratio (compute penalty)
+    train_ratio_meta_objective: 'val'  # held-out metric to maximize ('val'/'ret' negated) or loss/* to minimize
     log_every: 120
     report_every: 1200
     save_every: 900
@@ -200,6 +221,27 @@ defaults:
       act: silu
       norm: rms
       output: binary
+      outscale: 1.0
+      winit: trunc_normal_in
+
+    # Plan2Explore (Tier 4c): ensemble of one-step latent predictors. Their
+    # prediction VARIANCE (epistemic disagreement) is an intrinsic exploration
+    # reward. size: 0 disables the whole mechanism (zero overhead, fully
+    # backward-compatible). Set size>0 (e.g. 8) to enable. reward_free: in
+    # imagination feed the actor-critic the intrinsic disagreement reward instead
+    # of the task reward (reward-free pretraining); the world model and reward head
+    # still train on real transitions, so the reward head is ready for finetuning.
+    disag: {size: 0, scale: 1.0, reward_free: False, intr_scale: 1.0}
+
+    # Ensemble member head (Plan2Explore). Each regresses the next deterministic
+    # latent (deter) from (feat_t, act_t) with an MSE output. Kept small since
+    # there are disag.size independent copies. Only built when disag.size > 0.
+    disaghead:
+      layers: 2
+      units: 512
+      act: silu
+      norm: rms
+      output: mse
       outscale: 1.0
       winit: trunc_normal_in
 
