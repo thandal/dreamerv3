@@ -90,7 +90,8 @@ def main(argv=None):
         bind(_make_env_fn, config),
         bind(make_stream, config),
         bind(make_logger, config),
-        args, task_assignments=task_assignments)
+        args, task_assignments=task_assignments,
+        make_replay_at=bind(make_replay, config))
 
   elif config.script == 'train_eval':
     embodied.run.train_eval(
@@ -109,6 +110,21 @@ def main(argv=None):
         bind(_make_env_fn, config),
         bind(make_logger, config),
         args)
+
+  elif config.script == 'dream_gen':
+    embodied.run.dream_gen(
+        bind(make_agent, config),
+        bind(make_replay, config, 'replay'),
+        bind(make_stream, config),
+        bind(make_logger, config),
+        args)
+
+  elif config.script == 'probe_competence':
+    embodied.run.probe_competence(
+        bind(make_agent, config),
+        bind(make_stream, config),
+        args,
+        make_replay_at=bind(make_replay, config))
 
   elif config.script == 'parallel':
     embodied.run.parallel.combined(

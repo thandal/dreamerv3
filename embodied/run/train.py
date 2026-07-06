@@ -1,4 +1,5 @@
 import collections
+import json
 from functools import partial as bind
 
 import elements
@@ -8,7 +9,7 @@ import numpy as np
 
 def train(
     make_agent, make_replay, make_env, make_stream, make_logger, args,
-    task_assignments=None):
+    task_assignments=None, make_replay_at=None):
 
   agent = make_agent()
   replay = make_replay()
@@ -94,11 +95,32 @@ def train(
           mean_length = np.mean([v['length'] for v in task_latest.values()])
           logger.add({'score': mean_score, 'length': mean_length}, prefix='episode')
 
+  # Per-task replay mirrors (Step 3c): additionally write each worker's stream to
+  # logdir/replay_<task>, so later stages can treat every task as its OWN reservoir
+  # (chunks carry no task label, but each worker plays a fixed task -> its stream is
+  # single-task). Add-only: never sampled here; joint training is unchanged.
+  mirrors = {}
+  if (getattr(args, 'replay_split_by_task', False)
+      and task_map and make_replay_at is not None):
+    for t in sorted(set(task_map.values())):
+      mirrors[t] = make_replay_at(f'replay_{t}')
+      mirrors[t].load()  # no-op on fresh dirs; reloads chunks on logdir resume
+    print('[replay split] per-task mirrors:', ', '.join(sorted(mirrors)))
+
+  def mirror_add(tran, worker):
+    t = task_map.get(worker)
+    if t in mirrors:
+      # Strip the task-id obs: mirrors are SINGLE-task reservoirs (the task label
+      # is the directory), and downstream single-task consumers (probe_competence,
+      # gated sleep, dream seeds) assert exact batch keys against their spaces.
+      mirrors[t].add({k: v for k, v in tran.items() if k != 'task_id'}, worker)
+
   fns = [bind(make_env, i) for i in range(args.envs)]
   driver = embodied.Driver(fns, parallel=not args.debug)
   driver.on_step(lambda tran, _: step.increment())
   driver.on_step(lambda tran, _: policy_fps.step())
   driver.on_step(replay.add)
+  mirrors and driver.on_step(mirror_add)
   driver.on_step(logfn)
 
   stream_train = iter(agent.stream(make_stream(replay, 'train')))
@@ -249,12 +271,175 @@ def train(
         agent=bind(agent.load, regex=args.from_checkpoint_regex)))
   cp.load_or_save()
 
+  # Offline consolidation ("sleep"): external replay chunk dirs (e.g. a joint foundation
+  # buffer + the wake buffer) form the consolidation reservoir. Plain mode merges them all
+  # into this run's replay; GATED mode (Step 3b) keeps each dir as its own reservoir and
+  # samples them by competence deficit (see below).
+  offline = bool(getattr(args, 'offline', False))
+  sources = (getattr(args, 'replay_dirs', '') or '').replace(',', ' ').split()
+  gated = (offline and bool(getattr(args, 'gated_sleep', False))
+           and make_replay_at is not None and len(sources) >= 2)
+  gate = None
+  if gated:
+    # Competence-gated sleep: one reservoir per source dir. Every sleep_probe_every
+    # updates, probe each reservoir's competence = the imagined lambda-return of the
+    # CURRENT policy from that reservoir's states ('ret_raw' -- RAW reward scale, so
+    # values are comparable across probes and stages; env-free; report() with
+    # training=False so no normalizer updates). Keep a per-source running high-water
+    # mark; sampling weight = relative deficit + floor. A source that starts degrading
+    # (e.g. the newest task eroding under consolidation) grows a deficit and defends
+    # itself; sources at their best decay to the floor.
+    # Step 3c: run.sleep_best_from = competence.json files (from probe_competence at
+    # each task's PEAK stage) initialize the high-water marks to LIFETIME bests, so
+    # the gate targets RECOVERY of already-eroded tasks, not just no-further-drops.
+    best_init = {}
+    for f in (getattr(args, 'sleep_best_from', '') or '').replace(',', ' ').split():
+      try:
+        loaded = json.loads(elements.Path(f).read())
+        best_init.update({k.rstrip('/'): float(v) for k, v in loaded.items()
+                          if v is not None})
+      except Exception as e:
+        print(f'[gated sleep] WARNING: could not read sleep_best_from {f}: {e}')
+    gate = dict(names=[], repl=[], stream=[], report=[], carry=[],
+                best=[], lo=[], comp=[], w=[], resp=[])
+    for i, d in enumerate(sources):
+      name = '_'.join(p for p in d.rstrip('/').split('/') if p)[-40:]
+      r = make_replay_at(f'sleep_src_{i}')
+      b0 = best_init.get(d.rstrip('/'))
+      print(f'[gated sleep] reservoir {i} ({name}) <- {d}'
+            + (f' | lifetime best init {b0:.3f}' if b0 is not None else ''))
+      r.load(directory=d)
+      gate['names'].append(name)
+      gate['repl'].append(r)
+      gate['stream'].append(iter(agent.stream(make_stream(r, 'train'))))
+      gate['report'].append(iter(agent.stream(make_stream(r, 'report'))))
+      gate['carry'].append(agent.init_report(args.batch_size))
+      gate['best'].append(b0)
+      gate['lo'].append(None)
+      gate['comp'].append(0.0)
+      gate['w'].append(1.0 / len(sources))
+      gate['resp'].append(1.0)
+    if best_init and all(b is None for b in gate['best']):
+      print('[gated sleep] WARNING: sleep_best_from given but no reservoir dir '
+            'matched its keys -- lifetime-best targeting is OFF', flush=True)
+  else:
+    for d in sources:
+      print(f'Merging replay chunks from {d} (offline consolidation reservoir)')
+      replay.load(directory=d)
+
+  def sleep_probe():
+    floor = float(getattr(args, 'sleep_gate_floor', 0.15))
+    resp_on = bool(getattr(args, 'sleep_gate_resp', False))
+    two_level = (bool(getattr(args, 'sleep_gate_two_level', False))
+                 and len(gate['names']) >= 2)
+    tol = float(getattr(args, 'sleep_gate_resp_tol', 0.02))
+    rfloor = float(getattr(args, 'sleep_gate_resp_floor', 0.25))
+    n = len(gate['names'])
+    prev_comp = list(gate['comp'])
+    prev_w = list(gate['w'])
+    for i in range(n):
+      gate['carry'][i], mets = agent.report(gate['carry'][i], next(gate['report'][i]))
+      c = mets.get('ret_raw', mets.get('ret', mets.get('val')))
+      if c is not None and np.isfinite(float(np.asarray(c))):
+        gate['comp'][i] = float(np.asarray(c))
+        b = gate['best'][i]
+        gate['best'][i] = gate['comp'][i] if b is None else max(b, gate['comp'][i])
+        lo = gate['lo'][i]
+        gate['lo'][i] = gate['comp'][i] if lo is None else min(lo, gate['comp'][i])
+    # Deficit = position within the source's OBSERVED competence range, (best-c)/
+    # (best-lo). Range-normalized rather than ratio-to-best (the old 1-c/b), which
+    # silently disabled gating for any task whose returns are negative or ~0
+    # (pong, DMC costs, sparse-before-first-reward) — b<=0 meant deficit 0 forever.
+    # Sign-agnostic and in [0,1] (lo <= c <= b): "fraction of known recovery to go".
+    # The denominator is floored at span_floor*|best| so a CONVERGED source (whose
+    # observed range is just probe noise) doesn't normalize noise by noise and
+    # carry a permanent ~0.5 pseudo-deficit; genuinely eroded sources have ranges
+    # far above the floor and are unaffected.
+    span_floor = float(getattr(args, 'sleep_gate_span_floor', 0.2))
+    deficits = [
+        max(0.0, (b - c) / max(b - lo, span_floor * abs(b), 1e-6))
+        if (b is not None and lo is not None and b - lo > 1e-6) else 0.0
+        for c, b, lo in zip(gate['comp'], gate['best'], gate['lo'])]
+    # Responsiveness (Step 3d): deficit assumes a dip is FORGETTING that rehearsal
+    # can recover. A never-mastered task (demon_attack) violates that -- permanent
+    # deficit, soaks weight, converts it into nothing. Track whether a source that
+    # received an above-uniform share actually improved since the last probe; decay
+    # unresponsive sources toward rfloor, let improving/resting ones recover (slow
+    # parole so they get retried after policy/WM state has changed).
+    if resp_on:
+      for i in range(n):
+        scale = max(abs(gate['best'][i] or 0.0), 1e-6)
+        boosted = prev_w[i] > (1.0 / n) + 1e-6
+        improved = (gate['comp'][i] - prev_comp[i]) > tol * scale
+        if boosted and not improved:
+          gate['resp'][i] = max(rfloor, gate['resp'][i] * 0.7)
+        elif boosted:
+          gate['resp'][i] = min(1.0, gate['resp'][i] + 0.2)
+        else:
+          gate['resp'][i] = min(1.0, gate['resp'][i] + 0.05)
+    eff = [d_ * r for d_, r in zip(deficits, gate['resp'])]
+    if two_level:
+      # Two-level gate: the LAST source is the new/wake reservoir by launcher
+      # convention. Top level = new-vs-old; old-pool deficit = MAX over members,
+      # not the mean whose blindness starved phoenix in 3b's lump gate.
+      # PROTECT-FIRST floor (Step 3e): under lifetime-best init the old pool
+      # starts at deficit ~1.0, so symmetric floors gave the new task only ~0.13
+      # at sleep-start -- starved exactly when the fresh wake policy is most
+      # fragile, defended only after erosion (the 3d 2lvl failure). The new pool
+      # is floored at new_floor (protect first, yield the excess later); it can
+      # still rise ABOVE the floor when its own deficit grows (3b's 73% regime).
+      new_floor = float(getattr(args, 'sleep_gate_new_floor', 0.5))
+      raw_pool = [max(eff[:-1]) + floor, eff[-1] + floor]
+      w_new = max(raw_pool[1] / sum(raw_pool), new_floor)
+      w_old = 1.0 - w_new
+      raw_old = [e + floor for e in eff[:-1]]
+      gate['w'] = [w_old * x / sum(raw_old) for x in raw_old] + [w_new]
+    else:
+      raw = [e + floor for e in eff]
+      gate['w'] = [x / sum(raw) for x in raw]
+    print(f'[gated sleep] step {int(step)} | ' + ' | '.join(
+        f'{nm}: ret={c:.2f} best={b if b is None else round(b, 2)} w={w:.2f} r={r:.2f}'
+        for nm, c, b, w, r in zip(gate['names'], gate['comp'], gate['best'],
+                                  gate['w'], gate['resp'])),
+        flush=True)
+    for nm, c, w, r in zip(gate['names'], gate['comp'], gate['w'], gate['resp']):
+      train_agg.add({f'gate/{nm}/comp': c, f'gate/{nm}/weight': w,
+                     f'gate/{nm}/resp': r}, prefix='sleep')
+
   print('Start training loop')
+  if offline:
+    print('OFFLINE (sleep) mode: replay-only consolidation, no env collection'
+          + (' [COMPETENCE-GATED]' if gated else ''))
   policy = lambda *args: agent.policy(*args, mode='train')
   driver.reset(agent.init_policy)
   while step < args.steps:
 
-    driver(policy, steps=10)
+    if offline:
+      # Sleep: gradient updates sampled from the reservoir(s); no driver / no env data.
+      for _ in range(10):
+        if gated:
+          if int(step) >= getattr(sleep_probe, 'next', 0):
+            sleep_probe()
+            sleep_probe.next = int(step) + int(getattr(args, 'sleep_probe_every', 2000))
+          need = args.batch_size * args.batch_length
+          ok = [i for i, r in enumerate(gate['repl']) if len(r) >= need]
+          if not ok:
+            break
+          wts = np.array([gate['w'][i] for i in ok])
+          src = int(np.random.choice(ok, p=wts / wts.sum()))
+          batch = next(gate['stream'][src])
+        else:
+          if len(replay) < args.batch_size * args.batch_length:
+            break
+          batch = next(stream_train)
+        carry_train[0], outs, mets = agent.train(carry_train[0], batch)
+        train_fps.step(batch_steps)
+        if 'replay' in outs:
+          (gate['repl'][src] if gated else replay).update(outs['replay'])
+        train_agg.add(mets, prefix='train')
+        step.increment()
+    else:
+      driver(policy, steps=10)
 
     if args.reset_every and should_reset(step):
       agent.reset_params(args.reset_regex)
@@ -313,5 +498,9 @@ def train(
 
     if should_save(step):
       cp.save()
+      for m in mirrors.values():
+        m.save()
 
+  for m in mirrors.values():
+    m.save()
   logger.close()

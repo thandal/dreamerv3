@@ -97,6 +97,20 @@ defaults:
     report_batches: 1
     from_checkpoint: ''
     from_checkpoint_regex: ''  # If set, only load params matching this regex (e.g. '^wm/' for world model only)
+    offline: False  # SLEEP/consolidation: train on the loaded replay only, NO env collection (driver skipped)
+    replay_dirs: ''  # space/comma-sep extra replay chunk dirs to merge at startup (offline consolidation reservoir)
+    gated_sleep: False  # competence-gated sleep: each replay_dir = one task reservoir; sample by competence deficit
+    sleep_probe_every: 2000  # gradient updates between per-reservoir competence probes (imagined lambda-return)
+    sleep_gate_floor: 0.15  # minimum sampling-weight share per reservoir (keeps all tasks warm)
+    replay_split_by_task: False  # ALSO save per-task replay mirrors (logdir/replay_<task>) during multitask collection -> per-task reservoirs for gated sleep (Step 3c)
+    sleep_best_from: ''  # space-sep competence.json files (--script probe_competence): init gated-sleep high-water marks to lifetime-PEAK competence -> recovery targeting, not just drop-protection
+    probe_batches: 8  # report batches averaged per reservoir by probe_competence
+    sleep_gate_resp: False  # responsiveness weighting: decay a source's deficit share when boosted-but-not-improving (never-mastered tasks stop soaking rehearsal budget)
+    sleep_gate_resp_tol: 0.02  # improvement threshold as a fraction of the source's best competence
+    sleep_gate_resp_floor: 0.25  # minimum responsiveness multiplier (keeps a retry chance)
+    sleep_gate_two_level: False  # two-level gate: LAST replay_dir = new-task pool vs old pool (2-source arithmetic on top, per-game within old; old-pool deficit = MAX over members)
+    sleep_gate_span_floor: 0.2  # deficit denominator floor as a fraction of |best|: keeps probe noise on converged sources from reading as deficit (range-normalized deficit, sign-agnostic)
+    sleep_gate_new_floor: 0.5  # two-level gate: minimum top-level share for the new-task pool (protect-first; can rise above when the new task itself erodes)
     reset_every: 0  # If >0, re-init params matching reset_regex every N env steps (SPR/SR-SPR periodic resets)
     reset_regex: '^ac/'  # What to reset; '^ac/' = full actor-critic incl. slow target and retnorm
     episode_timeout: 180
@@ -131,7 +145,8 @@ defaults:
 
   agent:
     # Loss scales (β coefficients)
-    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, bc_loss: 0.0}
+    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, bc_loss: 0.0, sleep_bc: 1.0}
+    sleep_bc: False  # BC-anchored consolidation (Step 4b): during sleep the MAIN actor clones stored actions (label-free policy-space rehearsal); imagination policy/value losses zeroed; WM losses unchanged
 
     # Optimizer parameters
     # Try: lr: 1e-4, 3e-5, etc. | agc: 0.1, 0.5 | beta1: 0.5, 0.9 | beta2: 0.99, 0.999
@@ -289,6 +304,9 @@ defaults:
 
     imag_last: 0
     imag_length: 15      # Imagination horizon for actor-critic
+    dream_gen: False     # Step-3 generative replay: report() emits WM-generated (dreamed) trajectories, not metrics
+    dream_length: 32     # Imagined rollout length per dreamed trajectory (generative replay)
+    dream_starts: 4      # Imagined rollouts per seed sequence (B*dream_starts dreams per report call)
     horizon: 333         # Planning horizon
     contdisc: True
 
@@ -303,6 +321,9 @@ defaults:
       slowreg: 1.0
       pmpo_alpha: 0.5    # PMPO: balance between D+ and D- sets (only used when imag_loss_type=pmpo)
       pmpo_beta: 0.03     # PMPO: reverse KL to BC prior strength (only used when imag_loss_type=pmpo)
+      pmpo_ent_target: 0.0  # PMPO fix: entropy floor in nats (hinge); 0 = off. Counters PMPO's constant-force sharpening
+      pmpo_ent_coef: 1.0    # PMPO fix: strength of the entropy-floor hinge
+      pmpo_logp_min: -1e9   # PMPO fix: clip log-prob in the D- push-down term (bounds the sharpening incentive); -1e9 = off
 
     repl_loss:
       slowtar: False
@@ -474,9 +495,27 @@ vqvae_latent:
 pmpo:
   agent:
     imag_loss_type: pmpo
-    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, bc_loss: 1.0}
+    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, bc_loss: 1.0, sleep_bc: 1.0}
     imag_loss:
       actent: 1e-2       # PMPO needs higher entropy than REINFORCE (sign-based loss has different gradient scale)
     # PMPO is scale-invariant, so disable return/advantage normalization
+    retnorm: {impl: none, rate: 0.01, limit: 1e-8}
+    advnorm: {impl: none, rate: 0.01, limit: 1e-8}
+
+# PMPO + the 2026-07-01 entropy-collapse fix (bounded push-down + entropy floor).
+# Diagnosis (wandb pmpo_val runs): the sign-split set-means apply CONSTANT-magnitude force
+# (unlike advantage-weighted REINFORCE, whose force fades as adv->0), and the D- term (+logpi)
+# has unbounded incentive to zero out actions -> entropy collapsed to ~0.1-0.25 nats by ~20K
+# steps (REINFORCE stays 0.6-1.2 on the same games) -> exploration died -> phoenix locked in
+# low, atlantis peaked 22700 then collapsed. The beta=0.03 BC-KL anchors to the agent's own
+# replay, which sharpens along with the policy (echo chamber) and cannot prevent this.
+pmpofix:
+  agent:
+    imag_loss_type: pmpo
+    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, bc_loss: 1.0, sleep_bc: 1.0}
+    imag_loss:
+      actent: 1e-2
+      pmpo_ent_target: 1.0  # ~35% of ln(18)=2.89; REINFORCE equilibrates at 0.6-1.2 nats on the shooters
+      pmpo_logp_min: -6.0   # stop pushing down actions already below p~0.25%
     retnorm: {impl: none, rate: 0.01, limit: 1e-8}
     advnorm: {impl: none, rate: 0.01, limit: 1e-8}

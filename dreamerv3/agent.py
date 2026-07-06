@@ -366,6 +366,26 @@ class Agent(embodied.jax.Agent):
     else:
       losses['bc_loss'] = jnp.zeros((B, T))
 
+    # BC-anchored consolidation (Step 4b, agent.sleep_bc): during sleep the MAIN
+    # actor trains by behavioral cloning on the STORED actions instead of
+    # imagination policy gradients (which conflict across tasks in a shared actor
+    # -- the 3e SI plateau). The policy worth preserving is implicit in the data
+    # (label-free); supervised anchors in disjoint state regions don't fight.
+    # Pairing: features at t with the action taken FROM t (= prevact[t+1]); the
+    # last step has no next action and is masked. Features are sg'd (actor-only;
+    # the WM keeps its own losses). Imagination policy/value losses are zeroed
+    # below; the imagination pass still runs so report()/gate metrics are intact.
+    sleep_bc = bool(getattr(self.config, 'sleep_bc', False))
+    if sleep_bc:
+      bcfeat = sg(self.feat2tensor(repfeat))
+      pol_dists = self.pol(bcfeat[:, :-1], 2)
+      nextact = {k: prevact[k][:, 1:] for k in self.act_space}
+      bcvals = sum(-pol_dists[k].logp(sg(nextact[k])) for k in self.act_space)
+      losses['sleep_bc'] = jnp.concatenate(
+          [bcvals, jnp.zeros((B, 1), bcvals.dtype)], 1)
+    else:
+      losses['sleep_bc'] = jnp.zeros((B, T))
+
     # Imagination
     K = min(self.config.imag_last or T, T)
     H = self.config.imag_length
@@ -431,6 +451,13 @@ class Agent(embodied.jax.Agent):
         **imag_extra)
     losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()})
     metrics.update(mets)
+    if sleep_bc:
+      # Actor/critic learn from sleep_bc only; imagination losses zeroed (0*x cuts
+      # the gradient) but the rollout above still ran, so ret/ret_raw metrics for
+      # the competence gate are unaffected.
+      for k in ('policy', 'value'):
+        if k in losses:
+          losses[k] = 0.0 * losses[k]
 
     # Replay
     if self.config.repval_loss:
@@ -491,6 +518,8 @@ class Agent(embodied.jax.Agent):
     return loss, (carry, entries, outs, metrics)
 
   def report(self, carry, data):
+    if getattr(self.config, 'dream_gen', False):
+      return self._gen_dreams(carry, data)
     if not self.config.report:
       return carry, {}
 
@@ -508,7 +537,7 @@ class Agent(embodied.jax.Agent):
         carry, obs, prevact, None, training=False)
     metrics.update({k: v for k, v in mets.items()
                     if isinstance(k, str) and (
-                        k.startswith('loss/') or k in ('ret', 'val'))})
+                        k.startswith('loss/') or k in ('ret', 'ret_raw', 'val'))})
     # 'val' = mean held-out predicted value (return proxy) and 'ret' = held-out
     # lambda-return are surfaced so the Tier-4a meta-gradient controller can
     # descend a RETURN objective instead of value-prediction loss (train.py).
@@ -562,6 +591,47 @@ class Agent(embodied.jax.Agent):
 
     carry = (*new_carry, {k: data[k][:, -1] for k in self.act_space})
     return carry, metrics
+
+  def _gen_dreams(self, carry, data):
+    # Step-3 generative replay: imagine ACTOR-driven rollouts from seed observations
+    # and decode them to synthetic obs, so the sleep/consolidation phase can train on
+    # WM-GENERATED foundation data instead of the stored buffer. Mirrors report()'s
+    # observe->imagine->decode, but drives imagination with the current policy (novel
+    # trajectories) and returns the dreamed trajectory (obs/action/reward/cont) in the
+    # output dict; the dream_gen run-script writes them as replay chunks.
+    carry, obs, prevact, _ = self._apply_replay_context(carry, data)
+    (enc_carry, dyn_carry, dec_carry) = carry
+    B, T = obs['is_first'].shape
+    H = int(getattr(self.config, 'dream_length', 32))
+    enc_carry, _, tokens = self.enc(enc_carry, obs, obs['is_first'], training=False)
+    dyn_carry, dyn_entries, _ = self.dyn.observe(
+        dyn_carry, tokens, prevact, obs['is_first'], training=False)
+    # Imagine H steps from the last K observed steps (B*K starts), actor-driven.
+    K = min(int(getattr(self.config, 'dream_starts', 4)), T)
+    starts = self.dyn.starts(dyn_entries, dyn_carry, K)
+    policyfn = lambda f: sample(self.pol(self.feat2tensor(f), 1))
+    _, imgfeat, imgact = self.dyn.imagine(starts, policyfn, H, training=False)
+    BK = B * K
+    inp = self.feat2tensor(imgfeat)
+    reward = self.rew(inp, 2).pred()          # (BK, H)
+    cont = self.con(inp, 2).prob(1)           # (BK, H) P(continue)
+    dec_carry2 = self.dec.initial(BK)
+    _, _, recons = self.dec(
+        dec_carry2, imgfeat, jnp.zeros((BK, H), bool), training=False)
+    out = {}
+    for k in self.dec.imgkeys:
+      img = recons[k].pred()                  # (BK, H, ...) float in [0, 1]
+      out[f'dream/{k}'] = jnp.clip(img * 255, 0, 255).astype(jnp.uint8)
+    for k in self.act_space:
+      out[f'dream/act/{k}'] = imgact[k]        # (BK, H, ...)
+    out['dream/reward'] = reward.astype(jnp.float32)
+    out['dream/cont'] = cont.astype(jnp.float32)
+    # RSSM latents for the replay_context feature (chunk keys dyn/deter, dyn/stoch).
+    out['dream/deter'] = imgfeat['deter']
+    out['dream/stoch'] = imgfeat['stoch']
+    carry = (enc_carry, dyn_carry, dec_carry,
+             {k: data[k][:, -1] for k in self.act_space})
+    return carry, out
 
   def _apply_replay_context(self, carry, data):
     (enc_carry, dyn_carry, dec_carry, prevact) = carry
@@ -687,6 +757,10 @@ def imag_loss(
   metrics['rew'] = rew.mean()
   metrics['con'] = con.mean()
   metrics['ret'] = ret_normed.mean()
+  # Raw-scale imagined lambda-return (no retnorm): comparable across checkpoints
+  # and stages, unlike ret_normed whose scale drifts with the return normalizer.
+  # Used as the competence signal for gated sleep + probe_competence (Step 3c).
+  metrics['ret_raw'] = ret.mean()
   metrics['val'] = val.mean()
   metrics['tar'] = tar_normed.mean()
   metrics['weight'] = weight.mean()
@@ -719,6 +793,9 @@ def imag_loss_pmpo(
     slowreg=1.0,
     pmpo_alpha=0.5,
     pmpo_beta=0.3,
+    pmpo_ent_target=0.0,
+    pmpo_ent_coef=1.0,
+    pmpo_logp_min=-1e9,
     bc_policy=None,
 ):
   """PMPO policy loss (DreamerV4-style).
@@ -763,10 +840,25 @@ def imag_loss_pmpo(
   neg_mask = f32(adv <= 0)
   pos_count = jnp.maximum((w * pos_mask).sum(), 1e-8)
   neg_count = jnp.maximum((w * neg_mask).sum(), 1e-8)
-  # Increase log-prob for positive advantage, decrease for negative
+  # Increase log-prob for positive advantage, decrease for negative.
+  # The D- (push-down) term is clipped at pmpo_logp_min: without it, +logpi has an
+  # unbounded incentive to zero out actions (the softmax gradient does not vanish as
+  # p->0), which relentlessly sharpens the policy — measured entropy collapse to
+  # ~0.1-0.25 nats by 20K steps on the shooters. Clipping stops the push once an
+  # action is already unlikely.
   pos_loss = -(w * logpi * pos_mask).sum() / pos_count
-  neg_loss = (w * logpi * neg_mask).sum() / neg_count
+  neg_loss = (w * jnp.maximum(logpi, pmpo_logp_min) * neg_mask).sum() / neg_count
   ent_loss = -(w * actent * sum(ents.values())).mean()
+  # Entropy floor (hinge): PMPO's set-mean forces have constant magnitude (they don't
+  # fade at equilibrium like advantage-weighted REINFORCE), so a fixed small bonus
+  # cannot prevent collapse. The hinge is inactive above the target and pushes back
+  # strongly below it.
+  if pmpo_ent_target > 0:
+    ent_mean = (w * sum(ents.values())).sum() / jnp.maximum(w.sum(), 1e-8)
+    ent_hinge = pmpo_ent_coef * jnp.maximum(pmpo_ent_target - ent_mean, 0.0)
+    metrics['pmpo_ent_hinge'] = ent_hinge
+  else:
+    ent_hinge = 0.0
   # Reverse KL to behavioral cloning prior: KL(π_θ || π_BC)
   if bc_policy is not None and pmpo_beta > 0:
     kl_bc = sum([policy[k].kl(bc_policy[k])[:, :-1] for k in policy])
@@ -777,7 +869,7 @@ def imag_loss_pmpo(
   # Broadcast back to per-element shape for compatibility
   policy_loss = (
       pmpo_alpha * pos_loss + (1 - pmpo_alpha) * neg_loss
-      + ent_loss + pmpo_beta * kl_term)
+      + ent_loss + ent_hinge + pmpo_beta * kl_term)
   # Expand to (B, H) to match expected shape
   policy_loss_expanded = jnp.broadcast_to(
       policy_loss / w.size, w.shape)
@@ -801,6 +893,7 @@ def imag_loss_pmpo(
   metrics['rew'] = rew.mean()
   metrics['con'] = con.mean()
   metrics['ret'] = ret_normed.mean()
+  metrics['ret_raw'] = ret.mean()  # raw scale, cross-stage comparable (see imag_loss)
   metrics['val'] = val.mean()
   metrics['tar'] = tar_normed.mean()
   metrics['weight'] = weight.mean()
