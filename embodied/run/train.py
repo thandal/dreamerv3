@@ -275,6 +275,10 @@ def train(
   # buffer + the wake buffer) form the consolidation reservoir. Plain mode merges them all
   # into this run's replay; GATED mode (Step 3b) keeps each dir as its own reservoir and
   # samples them by competence deficit (see below).
+  # Plain mode doubles as demonstration seeding for ONLINE runs (offline=False): the merged
+  # chunks just become part of the starting replay. Must stay AFTER load_or_save: on a fresh
+  # logdir that call only saves -- it never loads -- so chunks placed in logdir/replay ahead
+  # of time are silently ignored.
   offline = bool(getattr(args, 'offline', False))
   sources = (getattr(args, 'replay_dirs', '') or '').replace(',', ' ').split()
   gated = (offline and bool(getattr(args, 'gated_sleep', False))
@@ -333,6 +337,8 @@ def train(
     for d in sources:
       print(f'Merging replay chunks from {d} (offline consolidation reservoir)')
       replay.load(directory=d)
+    if sources:
+      print(f'Replay chunks after merge: {len(replay.chunks)}', flush=True)
 
   def sleep_probe():
     floor = float(getattr(args, 'sleep_gate_floor', 0.15))

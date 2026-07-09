@@ -38,6 +38,7 @@ defaults:
     minecraft: {size: [64, 64], break_speed: 100.0, logs: False, length: 36000}
     dmc: {size: [64, 64], repeat: 1, proprio: True, image: True, camera: -1}
     loconav: {size: [64, 64], repeat: 1, camera: -1}
+    excavator: {repo: '', length: 1800, noise: True, size: 64, use_seed: True, shaping: 5.0, reward_mode: dmc}
 
   # Multi-task configuration
   multitask:
