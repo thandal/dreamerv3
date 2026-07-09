@@ -279,6 +279,13 @@ def train(
   sources = (getattr(args, 'replay_dirs', '') or '').replace(',', ' ').split()
   gated = (offline and bool(getattr(args, 'gated_sleep', False))
            and make_replay_at is not None and len(sources) >= 2)
+  # Seeded RNG for gated-sleep reservoir selection. The GLOBAL np.random was
+  # previously used (unseeded) -> the per-step reservoir draw diverged run-to-run,
+  # and because the competence gate is a closed loop (draws -> competence -> weights
+  # -> draws) that difference AMPLIFIED into large retention variance between
+  # identical-seed runs (battery 2026-07-08: phoenix-retention SD_replicate 470 ≫
+  # SD_seed 82). This makes the reservoir schedule seed-deterministic.
+  sleep_rng = np.random.default_rng(int(getattr(args, 'seed', 0)))
   gate = None
   if gated:
     # Competence-gated sleep: one reservoir per source dir. Every sleep_probe_every
@@ -426,7 +433,7 @@ def train(
           if not ok:
             break
           wts = np.array([gate['w'][i] for i in ok])
-          src = int(np.random.choice(ok, p=wts / wts.sum()))
+          src = int(sleep_rng.choice(ok, p=wts / wts.sum()))
           batch = next(gate['stream'][src])
         else:
           if len(replay) < args.batch_size * args.batch_length:

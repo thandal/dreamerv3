@@ -27,10 +27,13 @@ defaults:
     user: ''
 
   env:
-    atari: {size: [96, 96], repeat: 4, sticky: True, gray: True, actions: all, lives: unused, noops: 30, autostart: False, pooling: 2, aggregate: max, resize: pillow, clip_reward: False}
+    atari: {size: [96, 96], repeat: 4, sticky: True, gray: True, actions: all, lives: unused, noops: 30, autostart: False, pooling: 2, aggregate: max, resize: pillow, clip_reward: False, use_seed: True}
     procgen: {size: [96, 96], resize: pillow}
     crafter: {size: [64, 64], logs: False, use_logdir: False}
-    atari100k: {size: [64, 64], repeat: 4, sticky: False, gray: False, actions: needed, lives: unused, noops: 30, autostart: False, resize: pillow, clip_reward: False}
+    atari100k: {size: [64, 64], repeat: 4, sticky: False, gray: False, actions: needed, lives: unused, noops: 30, autostart: False, resize: pillow, clip_reward: False, use_seed: True}
+    # use_seed added 2026-07-07: without it the Atari env got seed=None -> OS-entropy RNG -> ALE
+    # random_seed uncontrolled -> config.seed never governed the env stream (noop starts, ALE
+    # stochasticity). Every pre-2026-07-07 "seed" controlled only net init / replay / JAX.
     dmlab: {size: [64, 64], repeat: 4, episodic: True, use_seed: True}
     minecraft: {size: [64, 64], break_speed: 100.0, logs: False, length: 36000}
     dmc: {size: [64, 64], repeat: 1, proprio: True, image: True, camera: -1}
@@ -344,6 +347,15 @@ defaults:
     repval_grad: True
     report: True
     report_gradnorms: False
+
+# Small model for the DATA-LIMITED atari100k regime, matching the upstream benchmark
+# recipe (git ec526b9: rssm.deter 512, cnn_depth 32, units 512) that produced
+# scores/atari100k-dreamerv3.json.gz. Pair with --run.train_ratio 1024
+# --jax.compute_dtype float32 --env.atari100k.actions needed (2026-07-08 reproduction).
+size_a100k: &size_a100k
+  .*\.rssm: {deter: 512, hidden: 512, classes: 32}
+  .*\.depth: 32
+  .*\.units: 512
 
 size1m: &size1m
   .*\.rssm: {deter: 512, hidden: 64, classes: 4}
